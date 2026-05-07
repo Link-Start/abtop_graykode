@@ -971,6 +971,7 @@ mod tests {
         file.flush().unwrap();
     }
 
+    #[cfg(windows)]
     fn proc_info(pid: u32, ppid: u32, command: &str) -> ProcInfo {
         ProcInfo {
             pid,
