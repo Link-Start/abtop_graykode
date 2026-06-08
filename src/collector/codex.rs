@@ -1,12 +1,17 @@
 use super::process::{self, ProcInfo};
-use crate::model::{AgentSession, ChildProcess, RateLimitInfo, SessionStatus, ToolCall};
+use crate::model::{
+    AgentSession, ChatMessage, ChatRole, ChildProcess, RateLimitInfo, SessionStatus, ToolCall,
+    MAX_CHAT_MESSAGES,
+};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 #[cfg(all(not(target_os = "linux"), not(target_os = "windows")))]
 use std::process::Command;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::time::{Duration, Instant};
 
 /// Collector for OpenAI Codex CLI sessions.
 ///
@@ -24,6 +29,80 @@ pub struct CodexCollector {
     sessions_dir: PathBuf,
     /// Latest rate limit info parsed from Codex JSONL token_count events.
     pub last_rate_limit: Option<RateLimitInfo>,
+    desktop_recent_scanner: DesktopRecentRolloutScanner,
+}
+
+#[derive(Clone, Copy)]
+struct CodexProcessContext {
+    pid: Option<u32>,
+    is_exec: bool,
+    owns_process_tree: bool,
+    unknown_process_owner: bool,
+}
+
+struct DesktopRecentRolloutScanResult {
+    rollouts: Vec<PathBuf>,
+}
+
+struct DesktopRecentRolloutScanner {
+    cached: Vec<PathBuf>,
+    in_flight: bool,
+    last_started: Option<Instant>,
+    tx: Sender<DesktopRecentRolloutScanResult>,
+    rx: Receiver<DesktopRecentRolloutScanResult>,
+}
+
+const DESKTOP_RECENT_ROLLOUT_RESCAN_INTERVAL: Duration = Duration::from_secs(60);
+
+impl DesktopRecentRolloutScanner {
+    fn new() -> Self {
+        let (tx, rx) = mpsc::channel();
+        Self {
+            cached: Vec::new(),
+            in_flight: false,
+            last_started: None,
+            tx,
+            rx,
+        }
+    }
+
+    fn update(&mut self, sessions_dir: &Path, active_mtime_secs: u64) -> Vec<PathBuf> {
+        self.poll_completed();
+        if self.should_start(sessions_dir) {
+            self.start(sessions_dir.to_path_buf(), active_mtime_secs);
+        }
+        self.cached.clone()
+    }
+
+    fn poll_completed(&mut self) {
+        while let Ok(result) = self.rx.try_recv() {
+            self.cached = result.rollouts;
+            self.in_flight = false;
+        }
+    }
+
+    fn should_start(&self, sessions_dir: &Path) -> bool {
+        if self.in_flight || !sessions_dir.exists() {
+            return false;
+        }
+        self.last_started
+            .is_none_or(|started| started.elapsed() >= DESKTOP_RECENT_ROLLOUT_RESCAN_INTERVAL)
+    }
+
+    fn start(&mut self, sessions_dir: PathBuf, active_mtime_secs: u64) {
+        self.in_flight = true;
+        self.last_started = Some(Instant::now());
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let rollouts = CodexCollector::recent_desktop_rollouts(
+                &sessions_dir,
+                &HashSet::new(),
+                &HashSet::new(),
+                active_mtime_secs,
+            );
+            let _ = tx.send(DesktopRecentRolloutScanResult { rollouts });
+        });
+    }
 }
 
 impl CodexCollector {
@@ -32,6 +111,7 @@ impl CodexCollector {
         Self {
             sessions_dir: home.join(".codex").join("sessions"),
             last_rate_limit: None,
+            desktop_recent_scanner: DesktopRecentRolloutScanner::new(),
         }
     }
 
@@ -47,10 +127,8 @@ impl CodexCollector {
         // Step 1: Find running codex processes from shared ps data (no extra ps call).
         // When MCP suppression is on, exclude `codex mcp-server` PIDs — those
         // are surfaced through the MCP servers panel instead. See issue #95.
-        let codex_pids = Self::find_codex_pids_from_shared(
-            &shared.process_info,
-            &shared.mcp_server_pids,
-        );
+        let codex_pids =
+            Self::find_codex_pids_from_shared(&shared.process_info, &shared.mcp_server_pids);
         let just_pids: Vec<u32> = codex_pids.iter().map(|(p, _)| *p).collect();
         let pid_to_jsonl = Self::map_pid_to_jsonl(&just_pids, &self.sessions_dir);
         let pid_is_exec: HashMap<u32, bool> = codex_pids.into_iter().collect();
@@ -62,8 +140,12 @@ impl CodexCollector {
         for (pid, jsonl_path) in &pid_to_jsonl {
             let is_exec = pid_is_exec.get(pid).copied().unwrap_or(false);
             if let Some((session, rl)) = self.load_session_with_rate_limit(
-                Some(*pid),
-                is_exec,
+                CodexProcessContext {
+                    pid: Some(*pid),
+                    is_exec,
+                    owns_process_tree: true,
+                    unknown_process_owner: false,
+                },
                 jsonl_path,
                 &shared.process_info,
                 &shared.children_map,
@@ -81,6 +163,114 @@ impl CodexCollector {
                     }
                 }
                 sessions.push(session);
+            }
+        }
+
+        let desktop_pids = Self::find_codex_desktop_pids_from_shared(
+            &shared.process_info,
+            &shared.mcp_server_pids,
+        );
+        if !desktop_pids.is_empty() {
+            let desktop_pid_to_rollouts: HashMap<u32, Vec<PathBuf>> = desktop_pids
+                .iter()
+                .filter_map(|pid| {
+                    shared
+                        .desktop_rollout_fd_map
+                        .get(pid)
+                        .map(|paths| (*pid, paths.clone()))
+                })
+                .collect();
+
+            // Prefer the filesystem view so Desktop sessions appear immediately,
+            // then use the async fd cache only to improve PID ownership.
+            let desktop_pid_for_path = Self::desktop_pid_by_rollout_path(
+                &desktop_pid_to_rollouts,
+                super::mcp::ACTIVE_MTIME_SECS,
+            );
+            let mut desktop_rollout_paths = Self::foreground_desktop_rollouts(
+                &self.sessions_dir,
+                &seen_jsonl,
+                &shared.mcp_owned_rollouts,
+                super::mcp::ACTIVE_MTIME_SECS,
+            );
+            for path in self
+                .desktop_recent_scanner
+                .update(&self.sessions_dir, super::mcp::ACTIVE_MTIME_SECS)
+            {
+                if seen_jsonl.contains(&path) || shared.mcp_owned_rollouts.contains(&path) {
+                    continue;
+                }
+                if !desktop_rollout_paths.contains(&path) {
+                    desktop_rollout_paths.push(path);
+                }
+            }
+            Self::sort_rollouts_by_mtime_desc(&mut desktop_rollout_paths);
+
+            for path in desktop_rollout_paths {
+                let pid = desktop_pid_for_path
+                    .get(&path)
+                    .copied();
+                let process_ctx = CodexProcessContext {
+                    pid,
+                    is_exec: false,
+                    owns_process_tree: false,
+                    unknown_process_owner: pid.is_none(),
+                };
+                if let Some((session, rl)) = self.load_session_with_rate_limit(
+                    process_ctx,
+                    &path,
+                    &shared.process_info,
+                    &shared.children_map,
+                    &shared.ports,
+                ) {
+                    seen_jsonl.insert(path);
+                    if let Some(new_rl) = rl {
+                        let newer = self
+                            .last_rate_limit
+                            .as_ref()
+                            .is_none_or(|old| new_rl.updated_at > old.updated_at);
+                        if newer {
+                            super::rate_limit::write_codex_cache(&new_rl);
+                            self.last_rate_limit = Some(new_rl);
+                        }
+                    }
+                    sessions.push(session);
+                }
+            }
+
+            // Retain fd-only discovery for files not visible in today's active
+            // scan; this is a fallback, not the first-paint path.
+            for (pid, path) in Self::active_desktop_rollouts(
+                desktop_pid_to_rollouts,
+                &seen_jsonl,
+                &shared.mcp_owned_rollouts,
+                super::mcp::ACTIVE_MTIME_SECS,
+            ) {
+                if let Some((session, rl)) = self.load_session_with_rate_limit(
+                    CodexProcessContext {
+                        pid: Some(pid),
+                        is_exec: false,
+                        owns_process_tree: false,
+                        unknown_process_owner: false,
+                    },
+                    &path,
+                    &shared.process_info,
+                    &shared.children_map,
+                    &shared.ports,
+                ) {
+                    seen_jsonl.insert(path);
+                    if let Some(new_rl) = rl {
+                        let newer = self
+                            .last_rate_limit
+                            .as_ref()
+                            .is_none_or(|old| new_rl.updated_at > old.updated_at);
+                        if newer {
+                            super::rate_limit::write_codex_cache(&new_rl);
+                            self.last_rate_limit = Some(new_rl);
+                        }
+                    }
+                    sessions.push(session);
+                }
             }
         }
 
@@ -120,8 +310,12 @@ impl CodexCollector {
                         }
                     }
                     if let Some((session, rl)) = self.load_session_with_rate_limit(
-                        None,
-                        false,
+                        CodexProcessContext {
+                            pid: None,
+                            is_exec: false,
+                            owns_process_tree: false,
+                            unknown_process_owner: false,
+                        },
                         &path,
                         &shared.process_info,
                         &shared.children_map,
@@ -161,10 +355,182 @@ impl CodexCollector {
         }
     }
 
+    fn is_active_desktop_rollout(path: &Path, active_mtime_secs: u64) -> bool {
+        let Ok(meta) = fs::metadata(path) else {
+            return false;
+        };
+        let Ok(modified) = meta.modified() else {
+            return false;
+        };
+        let age = std::time::SystemTime::now()
+            .duration_since(modified)
+            .unwrap_or_default();
+        if age.as_secs() >= active_mtime_secs {
+            return false;
+        }
+
+        parse_codex_jsonl(path).is_some_and(|result| result.is_codex_desktop())
+    }
+
+    fn active_desktop_rollouts(
+        pid_to_rollouts: HashMap<u32, Vec<PathBuf>>,
+        seen_jsonl: &HashSet<PathBuf>,
+        mcp_owned_rollouts: &HashSet<PathBuf>,
+        active_mtime_secs: u64,
+    ) -> Vec<(u32, PathBuf)> {
+        let mut candidates: Vec<(u32, PathBuf)> = pid_to_rollouts
+            .into_iter()
+            .flat_map(|(pid, paths)| paths.into_iter().map(move |path| (pid, path)))
+            .collect();
+        candidates.sort_by_key(|(_, path)| {
+            std::cmp::Reverse(
+                fs::metadata(path)
+                    .and_then(|meta| meta.modified())
+                    .unwrap_or(std::time::UNIX_EPOCH),
+            )
+        });
+
+        let mut emitted = HashSet::new();
+        candidates
+            .into_iter()
+            .filter(|(_, path)| {
+                !seen_jsonl.contains(path)
+                    && !mcp_owned_rollouts.contains(path)
+                    && emitted.insert(path.clone())
+                    && Self::is_active_desktop_rollout(path, active_mtime_secs)
+            })
+            .collect()
+    }
+
+    fn desktop_pid_by_rollout_path(
+        pid_to_rollouts: &HashMap<u32, Vec<PathBuf>>,
+        active_mtime_secs: u64,
+    ) -> HashMap<PathBuf, u32> {
+        Self::active_desktop_rollouts(
+            pid_to_rollouts.clone(),
+            &HashSet::new(),
+            &HashSet::new(),
+            active_mtime_secs,
+        )
+        .into_iter()
+        .map(|(pid, path)| (path, pid))
+        .collect()
+    }
+
+    fn foreground_desktop_rollouts(
+        sessions_dir: &Path,
+        seen_jsonl: &HashSet<PathBuf>,
+        mcp_owned_rollouts: &HashSet<PathBuf>,
+        active_mtime_secs: u64,
+    ) -> Vec<PathBuf> {
+        let Some(today_dir) = Self::today_session_dir(sessions_dir) else {
+            return Vec::new();
+        };
+        let roots = [today_dir];
+        Self::recent_desktop_rollouts_from_roots(
+            &roots,
+            seen_jsonl,
+            mcp_owned_rollouts,
+            active_mtime_secs,
+        )
+    }
+
+    fn recent_desktop_rollouts_from_roots(
+        roots: &[PathBuf],
+        seen_jsonl: &HashSet<PathBuf>,
+        mcp_owned_rollouts: &HashSet<PathBuf>,
+        active_mtime_secs: u64,
+    ) -> Vec<PathBuf> {
+        let mut candidates = Vec::new();
+        for root in roots {
+            Self::collect_recent_desktop_rollouts(
+                root,
+                seen_jsonl,
+                mcp_owned_rollouts,
+                active_mtime_secs,
+                &mut candidates,
+            );
+        }
+        Self::sort_rollouts_by_mtime_desc(&mut candidates);
+        candidates
+    }
+
+    fn recent_desktop_rollouts(
+        sessions_dir: &Path,
+        seen_jsonl: &HashSet<PathBuf>,
+        mcp_owned_rollouts: &HashSet<PathBuf>,
+        active_mtime_secs: u64,
+    ) -> Vec<PathBuf> {
+        let mut candidates = Vec::new();
+        Self::collect_recent_desktop_rollouts(
+            sessions_dir,
+            seen_jsonl,
+            mcp_owned_rollouts,
+            active_mtime_secs,
+            &mut candidates,
+        );
+        Self::sort_rollouts_by_mtime_desc(&mut candidates);
+        candidates
+    }
+
+    fn sort_rollouts_by_mtime_desc(paths: &mut [PathBuf]) {
+        paths.sort_by_key(|path| {
+            std::cmp::Reverse(
+                fs::metadata(path)
+                    .and_then(|meta| meta.modified())
+                    .unwrap_or(std::time::UNIX_EPOCH),
+            )
+        });
+    }
+
+    fn collect_recent_desktop_rollouts(
+        dir: &Path,
+        seen_jsonl: &HashSet<PathBuf>,
+        mcp_owned_rollouts: &HashSet<PathBuf>,
+        active_mtime_secs: u64,
+        candidates: &mut Vec<PathBuf>,
+    ) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+            let path = entry.path();
+            if file_type.is_dir() {
+                Self::collect_recent_desktop_rollouts(
+                    &path,
+                    seen_jsonl,
+                    mcp_owned_rollouts,
+                    active_mtime_secs,
+                    candidates,
+                );
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if !name.starts_with("rollout-") || !name.ends_with(".jsonl") {
+                continue;
+            }
+            if seen_jsonl.contains(&path) || mcp_owned_rollouts.contains(&path) {
+                continue;
+            }
+            if Self::is_active_desktop_rollout(&path, active_mtime_secs) {
+                candidates.push(path);
+            }
+        }
+    }
+
     fn load_session_with_rate_limit(
         &self,
-        pid: Option<u32>,
-        is_exec: bool,
+        process_ctx: CodexProcessContext,
         jsonl_path: &Path,
         process_info: &HashMap<u32, ProcInfo>,
         children_map: &HashMap<u32, Vec<u32>>,
@@ -172,11 +538,17 @@ impl CodexCollector {
     ) -> Option<(AgentSession, Option<RateLimitInfo>)> {
         let result = parse_codex_jsonl(jsonl_path)?;
 
-        let proc = pid.and_then(|p| process_info.get(&p));
-        let mem_mb = proc.map(|p| p.rss_kb / 1024).unwrap_or(0);
-        let display_pid = pid.unwrap_or(0);
+        let proc = process_ctx.pid.and_then(|p| process_info.get(&p));
+        let mem_mb = if process_ctx.owns_process_tree {
+            proc.map(|p| p.rss_kb / 1024).unwrap_or(0)
+        } else {
+            0
+        };
+        let display_pid = process_ctx.pid.unwrap_or(0);
 
-        let project_name = process::last_path_segment(&result.cwd).unwrap_or("?").to_string();
+        let project_name = process::last_path_segment(&result.cwd)
+            .unwrap_or("?")
+            .to_string();
 
         // Status detection
         // Note: Codex interactive sessions emit task_complete after every turn,
@@ -186,12 +558,15 @@ impl CodexCollector {
         // Mirrors Claude: trust the trailing-event-is-user signal alone.
         // Codex tool outputs flow through response_item, not user_message,
         // so model_generating only flips on real prompts.
-        let status = if !pid_alive || (is_exec && result.task_complete) {
+        let status = if process_ctx.unknown_process_owner {
+            SessionStatus::Unknown
+        } else if !pid_alive || (process_ctx.is_exec && result.task_complete) {
             SessionStatus::Done
         } else {
-            let has_active_child = pid.is_some_and(|p| {
-                process::has_active_descendant(p, children_map, process_info, 5.0)
-            });
+            let has_active_child = process_ctx.owns_process_tree
+                && process_ctx.pid.is_some_and(|p| {
+                    process::has_active_descendant(p, children_map, process_info, 5.0)
+                });
             if has_active_child || result.pending_since_ms > 0 {
                 SessionStatus::Executing
             } else if result.model_generating {
@@ -206,7 +581,9 @@ impl CodexCollector {
         // For interactive sessions, task_complete fires after every turn — ignore it.
         let current_tasks = if !result.current_task.is_empty() {
             vec![result.current_task]
-        } else if !pid_alive || (is_exec && result.task_complete) {
+        } else if matches!(status, SessionStatus::Unknown) {
+            vec!["unknown".to_string()]
+        } else if !pid_alive || (process_ctx.is_exec && result.task_complete) {
             vec!["finished".to_string()]
         } else if matches!(status, SessionStatus::Waiting) {
             vec!["waiting for input".to_string()]
@@ -224,7 +601,7 @@ impl CodexCollector {
         // Children: collect all descendants recursively (not just direct children)
         // so we catch grandchild processes that listen on ports.
         let mut children = Vec::new();
-        if let Some(p) = pid {
+        if let (true, Some(p)) = (process_ctx.owns_process_tree, process_ctx.pid) {
             let mut stack: Vec<u32> = children_map.get(&p).cloned().unwrap_or_default();
             let mut visited = std::collections::HashSet::new();
             while let Some(cpid) = stack.pop() {
@@ -283,10 +660,16 @@ impl CodexCollector {
                 children,
                 initial_prompt: result.initial_prompt,
                 first_assistant_text: String::new(),
+                chat_messages: result.chat_messages,
                 tool_calls: result.tool_calls,
                 pending_since_ms: result.pending_since_ms,
                 thinking_since_ms: result.thinking_since_ms,
                 file_accesses: vec![],
+                config_root: super::abbrev_path(
+                    self.sessions_dir
+                        .parent()
+                        .unwrap_or(std::path::Path::new(".")),
+                ),
             },
             rate_limit,
         ))
@@ -298,7 +681,7 @@ impl CodexCollector {
     /// are reported via the MCP servers panel instead.
     fn find_codex_pids_from_shared(
         process_info: &HashMap<u32, ProcInfo>,
-        mcp_server_pids: &std::collections::HashSet<u32>,
+        mcp_server_pids: &HashSet<u32>,
     ) -> Vec<(u32, bool)> {
         let mut pids = Vec::new();
         for (pid, info) in process_info {
@@ -308,7 +691,7 @@ impl CodexCollector {
             let cmd = &info.command;
             let is_exec = cmd.contains(" exec");
             let is_codex = process::cmd_has_binary(cmd, "codex");
-            if is_codex && !cmd.contains("app-server") && !cmd.contains("grep") {
+            if is_codex && !cmd.contains(" app-server") && !cmd.contains("grep") {
                 pids.push((*pid, is_exec));
             }
         }
@@ -331,6 +714,29 @@ impl CodexCollector {
             })
         });
 
+        pids
+    }
+
+    /// Find Codex Desktop app-server host PIDs. Desktop is kept separate from
+    /// CLI discovery because a single app-server PID can hold many rollout fds.
+    pub(crate) fn find_codex_desktop_pids_from_shared(
+        process_info: &HashMap<u32, ProcInfo>,
+        mcp_server_pids: &HashSet<u32>,
+    ) -> Vec<u32> {
+        let mut pids = Vec::new();
+        for (pid, info) in process_info {
+            if mcp_server_pids.contains(pid) {
+                continue;
+            }
+            let cmd = &info.command;
+            if process::cmd_has_binary(cmd, "codex")
+                && cmd.contains(" app-server")
+                && !cmd.contains("grep")
+            {
+                pids.push(*pid);
+            }
+        }
+        pids.sort_unstable();
         pids
     }
 
@@ -437,6 +843,12 @@ impl CodexCollector {
     }
 }
 
+impl Default for CodexCollector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl super::AgentCollector for CodexCollector {
     fn collect(&mut self, shared: &super::SharedProcessData) -> Vec<AgentSession> {
         self.collect_sessions(shared)
@@ -453,6 +865,7 @@ impl super::AgentCollector for CodexCollector {
 struct CodexJSONLResult {
     session_id: String,
     cwd: String,
+    originator: String,
     started_at: u64,
     model: String,
     /// Reasoning effort setting from turn_context: "minimal" | "low" | "medium" | "high".
@@ -471,6 +884,9 @@ struct CodexJSONLResult {
     model_generating: bool,
     last_activity: std::time::SystemTime,
     initial_prompt: String,
+    chat_messages: Vec<ChatMessage>,
+    /// Input tokens excluding cached input, matching AgentSession's additive
+    /// token accounting where cache reads are stored separately.
     total_input: u64,
     total_output: u64,
     total_cache_read: u64,
@@ -484,6 +900,12 @@ struct CodexJSONLResult {
     pending_since_ms: u64,
     /// Timestamp of the latest user prompt not yet followed by assistant output.
     thinking_since_ms: u64,
+}
+
+impl CodexJSONLResult {
+    fn is_codex_desktop(&self) -> bool {
+        self.originator == "Codex Desktop"
+    }
 }
 
 fn event_timestamp_ms(val: &Value) -> Option<u64> {
@@ -516,6 +938,29 @@ fn value_to_tool_arg(value: &Value) -> Option<String> {
 fn sanitize_tool_arg(arg: &str) -> String {
     let redacted = super::redact_secrets(arg);
     redacted.chars().take(120).collect()
+}
+
+fn push_chat_message(messages: &mut Vec<ChatMessage>, role: ChatRole, text: String) {
+    if text.is_empty() {
+        return;
+    }
+    messages.push(ChatMessage { role, text });
+    let len = messages.len();
+    if len > MAX_CHAT_MESSAGES {
+        messages.drain(..len - MAX_CHAT_MESSAGES);
+    }
+}
+
+fn clean_chat_text(raw: &str, max: usize) -> String {
+    let cleaned = raw
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty() && !l.starts_with("```"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let terminal_safe = super::sanitize_terminal_text(&cleaned);
+    let redacted = super::redact_secrets(&terminal_safe);
+    redacted.chars().take(max).collect()
 }
 
 fn parse_codex_tool_arg(arguments: &str) -> String {
@@ -614,6 +1059,7 @@ fn parse_codex_jsonl(path: &Path) -> Option<CodexJSONLResult> {
     let mut result = CodexJSONLResult {
         session_id: String::new(),
         cwd: String::new(),
+        originator: String::new(),
         started_at: 0,
         model: String::from("-"),
         effort: String::new(),
@@ -626,6 +1072,7 @@ fn parse_codex_jsonl(path: &Path) -> Option<CodexJSONLResult> {
         model_generating: false,
         last_activity: std::time::UNIX_EPOCH,
         initial_prompt: String::new(),
+        chat_messages: Vec::new(),
         total_input: 0,
         total_output: 0,
         total_cache_read: 0,
@@ -692,6 +1139,9 @@ fn parse_codex_jsonl(path: &Path) -> Option<CodexJSONLResult> {
                 if let Some(cwd) = payload["cwd"].as_str() {
                     result.cwd = cwd.to_string();
                 }
+                if let Some(originator) = payload["originator"].as_str() {
+                    result.originator = originator.to_string();
+                }
                 if let Some(ver) = payload["cli_version"].as_str() {
                     result.version = ver.to_string();
                 }
@@ -718,16 +1168,23 @@ fn parse_codex_jsonl(path: &Path) -> Option<CodexJSONLResult> {
                     Some("user_message") => {
                         result.model_generating = true;
                         result.thinking_since_ms = event_timestamp_ms(&val).unwrap_or(0);
-                        if result.initial_prompt.is_empty() {
-                            if let Some(msg) = payload["message"].as_str() {
+                        if let Some(msg) = payload["message"].as_str() {
+                            if result.initial_prompt.is_empty() {
                                 let truncated: String = msg.chars().take(120).collect();
                                 result.initial_prompt = super::redact_secrets(&truncated);
                             }
+                            push_chat_message(
+                                &mut result.chat_messages,
+                                ChatRole::User,
+                                clean_chat_text(msg, 500),
+                            );
                         }
                     }
                     Some("token_count") => {
                         let info = &payload["info"];
-                        // Use total_token_usage as cumulative snapshot for totals
+                        // Codex input_tokens already includes cached_input_tokens.
+                        // Store only the non-cached input portion so
+                        // AgentSession::total_tokens() does not double-count cache.
                         let total = &info["total_token_usage"];
                         if total.is_object() {
                             let inp = total["input_tokens"].as_u64().unwrap_or(0);
@@ -736,22 +1193,20 @@ fn parse_codex_jsonl(path: &Path) -> Option<CodexJSONLResult> {
                                 .as_u64()
                                 .or_else(|| total["cache_read_input_tokens"].as_u64())
                                 .unwrap_or(0);
-                            result.total_input = inp;
+                            result.total_input = inp.saturating_sub(cache);
                             result.total_output = out;
                             result.total_cache_read = cache;
                         }
-                        // Use last_token_usage for context % and sparkline
+                        // Use last_token_usage input as the current context window.
+                        // cached_input_tokens is a subset of input_tokens, not extra
+                        // context after compaction.
                         let last = &info["last_token_usage"];
                         if last.is_object() {
                             let inp = last["input_tokens"].as_u64().unwrap_or(0);
                             let out = last["output_tokens"].as_u64().unwrap_or(0);
-                            let cache = last["cached_input_tokens"]
-                                .as_u64()
-                                .or_else(|| last["cache_read_input_tokens"].as_u64())
-                                .unwrap_or(0);
-                            result.last_context_tokens = inp + cache;
+                            result.last_context_tokens = inp;
                             if result.token_history.len() < 10_000 {
-                                result.token_history.push(inp + out + cache);
+                                result.token_history.push(inp + out);
                             }
                         }
                         // Context window may also appear inside info
@@ -762,7 +1217,7 @@ fn parse_codex_jsonl(path: &Path) -> Option<CodexJSONLResult> {
                         // Plus plans: primary=5h(300min), secondary=7d(10080min).
                         // Free plans: primary=7d(10080min), secondary=null.
                         let rl = &payload["rate_limits"];
-                        if rl.is_object() {
+                        if rl.is_object() && is_account_level_codex_rate_limit(rl) {
                             let event_secs = val["timestamp"]
                                 .as_str()
                                 .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
@@ -795,6 +1250,13 @@ fn parse_codex_jsonl(path: &Path) -> Option<CodexJSONLResult> {
                         result.turn_count += 1;
                         result.model_generating = false;
                         result.thinking_since_ms = 0;
+                        if let Some(msg) = payload["message"].as_str() {
+                            push_chat_message(
+                                &mut result.chat_messages,
+                                ChatRole::Assistant,
+                                clean_chat_text(msg, 500),
+                            );
+                        }
                     }
                     Some("task_complete") => {
                         result.task_complete = true;
@@ -957,12 +1419,19 @@ fn parse_codex_jsonl(path: &Path) -> Option<CodexJSONLResult> {
     Some(result)
 }
 
+fn is_account_level_codex_rate_limit(rate_limits: &Value) -> bool {
+    matches!(rate_limits["limit_id"].as_str(), Some("codex") | None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::File;
     use std::io::Write;
+    use std::time::{Duration, SystemTime};
 
     const SESSION_META: &str = r#"{"type":"session_meta","timestamp":"2026-03-28T15:00:00Z","payload":{"id":"sess-123","cwd":"/home/user/project","cli_version":"0.1.5","timestamp":"2026-03-28T15:00:00Z","git":{"branch":"feature/x"}}}"#;
+    const DESKTOP_SESSION_META: &str = r#"{"type":"session_meta","timestamp":"2026-03-28T15:00:00Z","payload":{"id":"desktop-123","cwd":"/home/user/project","originator":"Codex Desktop","cli_version":"0.131.0-alpha.9","timestamp":"2026-03-28T15:00:00Z","git":{"branch":"feature/x"}}}"#;
 
     fn write_lines(file: &mut tempfile::NamedTempFile, lines: &[&str]) {
         for line in lines {
@@ -971,7 +1440,6 @@ mod tests {
         file.flush().unwrap();
     }
 
-    #[cfg(windows)]
     fn proc_info(pid: u32, ppid: u32, command: &str) -> ProcInfo {
         ProcInfo {
             pid,
@@ -980,6 +1448,36 @@ mod tests {
             cpu_pct: 0.0,
             command: command.to_string(),
         }
+    }
+
+    fn owned_process(pid: u32) -> CodexProcessContext {
+        CodexProcessContext {
+            pid: Some(pid),
+            is_exec: false,
+            owns_process_tree: true,
+            unknown_process_owner: false,
+        }
+    }
+
+    fn host_process(pid: u32) -> CodexProcessContext {
+        CodexProcessContext {
+            pid: Some(pid),
+            is_exec: false,
+            owns_process_tree: false,
+            unknown_process_owner: false,
+        }
+    }
+
+    fn write_jsonl(path: &Path, lines: &[&str]) {
+        let mut file = File::create(path).unwrap();
+        for line in lines {
+            writeln!(file, "{}", line).unwrap();
+        }
+        file.flush().unwrap();
+    }
+
+    fn set_modified(path: &Path, when: SystemTime) {
+        File::open(path).unwrap().set_modified(when).unwrap();
     }
 
     #[cfg(windows)]
@@ -1020,6 +1518,272 @@ mod tests {
     }
 
     #[test]
+    fn find_codex_pids_excludes_app_server() {
+        let mut process_info = HashMap::new();
+        process_info.insert(10, proc_info(10, 1, "codex --resume abc"));
+        process_info.insert(
+            20,
+            proc_info(
+                20,
+                1,
+                "/Applications/Codex.app/Contents/Resources/codex app-server --analytics-default-enabled",
+            ),
+        );
+
+        let pids = CodexCollector::find_codex_pids_from_shared(&process_info, &HashSet::new());
+
+        assert_eq!(pids, vec![(10, false)]);
+    }
+
+    #[test]
+    fn find_codex_pids_keeps_cli_with_app_server_in_path() {
+        let mut process_info = HashMap::new();
+        process_info.insert(
+            10,
+            proc_info(10, 1, "codex --cd /home/user/app-server --resume abc"),
+        );
+
+        let pids = CodexCollector::find_codex_pids_from_shared(&process_info, &HashSet::new());
+
+        assert_eq!(pids, vec![(10, false)]);
+    }
+
+    #[test]
+    fn find_codex_desktop_pids_detects_app_servers() {
+        let mut process_info = HashMap::new();
+        process_info.insert(
+            10,
+            proc_info(
+                10,
+                1,
+                "/Applications/Codex.app/Contents/Resources/codex app-server --analytics-default-enabled",
+            ),
+        );
+        process_info.insert(20, proc_info(20, 1, "codex app-server --listen stdio://"));
+
+        let pids =
+            CodexCollector::find_codex_desktop_pids_from_shared(&process_info, &HashSet::new());
+
+        assert_eq!(pids, vec![10, 20]);
+    }
+
+    #[test]
+    fn find_codex_desktop_pids_ignores_mcp_and_non_codex() {
+        let mut process_info = HashMap::new();
+        process_info.insert(10, proc_info(10, 1, "codex mcp-server"));
+        process_info.insert(20, proc_info(20, 1, "node app-server"));
+        process_info.insert(30, proc_info(30, 1, "grep codex app-server"));
+        process_info.insert(40, proc_info(40, 1, "codex app-server --listen stdio://"));
+        let mut mcp = HashSet::new();
+        mcp.insert(10);
+
+        let pids = CodexCollector::find_codex_desktop_pids_from_shared(&process_info, &mcp);
+
+        assert_eq!(pids, vec![40]);
+    }
+
+    #[test]
+    fn desktop_rollout_filter_requires_originator() {
+        let mut desktop = tempfile::NamedTempFile::new().unwrap();
+        write_lines(&mut desktop, &[DESKTOP_SESSION_META]);
+        let mut cli = tempfile::NamedTempFile::new().unwrap();
+        write_lines(&mut cli, &[SESSION_META]);
+
+        assert!(CodexCollector::is_active_desktop_rollout(
+            desktop.path(),
+            super::super::mcp::ACTIVE_MTIME_SECS
+        ));
+        assert!(!CodexCollector::is_active_desktop_rollout(
+            cli.path(),
+            super::super::mcp::ACTIVE_MTIME_SECS
+        ));
+    }
+
+    #[test]
+    fn active_desktop_rollouts_filters_stale_seen_and_cli_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let active = temp.path().join("rollout-active.jsonl");
+        let stale = temp.path().join("rollout-stale.jsonl");
+        let cli = temp.path().join("rollout-cli.jsonl");
+        let seen = temp.path().join("rollout-seen.jsonl");
+        write_jsonl(&active, &[DESKTOP_SESSION_META]);
+        write_jsonl(&stale, &[DESKTOP_SESSION_META]);
+        write_jsonl(&cli, &[SESSION_META]);
+        write_jsonl(&seen, &[DESKTOP_SESSION_META]);
+        set_modified(&stale, SystemTime::now() - Duration::from_secs(31 * 60));
+
+        let mut pid_to_rollouts = HashMap::new();
+        pid_to_rollouts.insert(
+            99,
+            vec![active.clone(), stale, cli, seen.clone(), active.clone()],
+        );
+        let seen_jsonl = HashSet::from([seen]);
+
+        let rollouts = CodexCollector::active_desktop_rollouts(
+            pid_to_rollouts,
+            &seen_jsonl,
+            &HashSet::new(),
+            super::super::mcp::ACTIVE_MTIME_SECS,
+        );
+
+        assert_eq!(rollouts, vec![(99, active)]);
+    }
+
+    #[test]
+    fn recent_desktop_rollouts_include_active_sessions_from_older_day_dirs() {
+        let sessions = tempfile::tempdir().unwrap();
+        let today = CodexCollector::today_session_dir(sessions.path()).unwrap_or_else(|| {
+            let now = chrono::Local::now();
+            sessions
+                .path()
+                .join(now.format("%Y").to_string())
+                .join(now.format("%m").to_string())
+                .join(now.format("%d").to_string())
+        });
+        let older = sessions.path().join("2026").join("05").join("20");
+        fs::create_dir_all(&today).unwrap();
+        fs::create_dir_all(&older).unwrap();
+        let active = today.join("rollout-active.jsonl");
+        let older_active = older.join("rollout-older-active.jsonl");
+        let stale = today.join("rollout-stale.jsonl");
+        let cli = today.join("rollout-cli.jsonl");
+        write_jsonl(&active, &[DESKTOP_SESSION_META]);
+        write_jsonl(&older_active, &[DESKTOP_SESSION_META]);
+        write_jsonl(&stale, &[DESKTOP_SESSION_META]);
+        write_jsonl(&cli, &[SESSION_META]);
+        set_modified(&stale, SystemTime::now() - Duration::from_secs(31 * 60));
+
+        let rollouts = CodexCollector::recent_desktop_rollouts(
+            sessions.path(),
+            &HashSet::new(),
+            &HashSet::new(),
+            super::super::mcp::ACTIVE_MTIME_SECS,
+        );
+
+        assert_eq!(rollouts.len(), 2);
+        assert!(rollouts.contains(&active));
+        assert!(rollouts.contains(&older_active));
+    }
+
+    #[test]
+    fn desktop_pid_by_rollout_path_uses_active_fd_cache_only_for_ownership() {
+        let temp = tempfile::tempdir().unwrap();
+        let active = temp.path().join("rollout-active.jsonl");
+        let stale = temp.path().join("rollout-stale.jsonl");
+        write_jsonl(&active, &[DESKTOP_SESSION_META]);
+        write_jsonl(&stale, &[DESKTOP_SESSION_META]);
+        set_modified(&stale, SystemTime::now() - Duration::from_secs(31 * 60));
+        let pid_to_rollouts = HashMap::from([(99, vec![active.clone(), stale])]);
+
+        let by_path = CodexCollector::desktop_pid_by_rollout_path(
+            &pid_to_rollouts,
+            super::super::mcp::ACTIVE_MTIME_SECS,
+        );
+
+        assert_eq!(by_path, HashMap::from([(active, 99)]));
+    }
+
+    #[test]
+    fn desktop_rollout_selection_loads_active_session_with_host_pid() {
+        let temp = tempfile::tempdir().unwrap();
+        let active = temp.path().join("rollout-active.jsonl");
+        let stale = temp.path().join("rollout-stale.jsonl");
+        write_jsonl(&active, &[DESKTOP_SESSION_META]);
+        write_jsonl(&stale, &[DESKTOP_SESSION_META]);
+        set_modified(&stale, SystemTime::now() - Duration::from_secs(31 * 60));
+
+        let mut pid_to_rollouts = HashMap::new();
+        pid_to_rollouts.insert(99, vec![active.clone(), stale]);
+        let rollouts = CodexCollector::active_desktop_rollouts(
+            pid_to_rollouts,
+            &HashSet::new(),
+            &HashSet::new(),
+            super::super::mcp::ACTIVE_MTIME_SECS,
+        );
+
+        let collector = CodexCollector::new();
+        let mut process_info = HashMap::new();
+        process_info.insert(
+            99,
+            proc_info(
+                99,
+                1,
+                "/Applications/Codex.app/Contents/Resources/codex app-server --analytics-default-enabled",
+            ),
+        );
+        process_info.insert(100, proc_info(100, 99, "cargo test"));
+        let children_map = HashMap::from([(99, vec![100])]);
+        let ports = HashMap::from([(100, vec![3000])]);
+        let sessions: Vec<AgentSession> = rollouts
+            .iter()
+            .filter_map(|(pid, path)| {
+                collector
+                    .load_session_with_rate_limit(
+                        host_process(*pid),
+                        path,
+                        &process_info,
+                        &children_map,
+                        &ports,
+                    )
+                    .map(|(session, _)| session)
+            })
+            .collect();
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].pid, 99);
+        assert_eq!(sessions[0].session_id, "desktop-123");
+        assert_eq!(sessions[0].agent_cli, "codex");
+        assert_eq!(sessions[0].status, SessionStatus::Waiting);
+        assert_eq!(sessions[0].mem_mb, 0);
+        assert!(sessions[0].children.is_empty());
+    }
+
+    #[test]
+    fn desktop_filesystem_only_rollout_is_unknown_without_fd_owner() {
+        let sessions = tempfile::tempdir().unwrap();
+        let today = sessions.path().join(
+            chrono::Local::now()
+                .format("%Y/%m/%d")
+                .to_string(),
+        );
+        fs::create_dir_all(&today).unwrap();
+        let active = today.join("rollout-active.jsonl");
+        write_jsonl(&active, &[DESKTOP_SESSION_META]);
+
+        let mut collector = CodexCollector {
+            sessions_dir: sessions.path().to_path_buf(),
+            last_rate_limit: None,
+            desktop_recent_scanner: DesktopRecentRolloutScanner::new(),
+        };
+        let mut shared = super::super::SharedProcessData {
+            process_info: HashMap::new(),
+            children_map: HashMap::new(),
+            ports: HashMap::new(),
+            slow_tick: false,
+            mcp_server_pids: HashSet::new(),
+            mcp_owned_rollouts: HashSet::new(),
+            mcp_suppress: true,
+            desktop_rollout_fd_map: HashMap::new(),
+        };
+        shared.process_info.insert(
+            99,
+            proc_info(
+                99,
+                1,
+                "/Applications/Codex.app/Contents/Resources/codex app-server --analytics-default-enabled",
+            ),
+        );
+
+        let sessions = collector.collect_sessions(&shared);
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].pid, 0);
+        assert_eq!(sessions[0].session_id, "desktop-123");
+        assert_eq!(sessions[0].status, SessionStatus::Unknown);
+        assert_eq!(sessions[0].current_tasks, vec!["unknown".to_string()]);
+    }
+
+    #[test]
     fn test_parse_codex_session_meta() {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         write_lines(&mut file, &[SESSION_META]);
@@ -1037,17 +1801,33 @@ mod tests {
             &mut file,
             &[
                 SESSION_META,
-                r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:00Z","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":500,"output_tokens":200,"cached_input_tokens":100},"last_token_usage":{"input_tokens":50,"output_tokens":20,"cached_input_tokens":10},"model_context_window":128000}}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:00Z","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":500,"output_tokens":200,"cached_input_tokens":100,"total_tokens":700},"last_token_usage":{"input_tokens":50,"output_tokens":20,"cached_input_tokens":10,"total_tokens":70},"model_context_window":128000}}}"#,
             ],
         );
         let result = parse_codex_jsonl(file.path()).unwrap();
-        assert_eq!(result.total_input, 500);
+        assert_eq!(result.total_input, 400);
         assert_eq!(result.total_output, 200);
         assert_eq!(result.total_cache_read, 100);
-        assert_eq!(result.last_context_tokens, 60); // 50 + 10
+        assert_eq!(result.last_context_tokens, 50);
         assert_eq!(result.context_window, 128000);
         assert_eq!(result.token_history.len(), 1);
-        assert_eq!(result.token_history[0], 80); // 50 + 20 + 10
+        assert_eq!(result.token_history[0], 70);
+    }
+
+    #[test]
+    fn test_parse_codex_context_does_not_double_count_cached_input() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write_lines(
+            &mut file,
+            &[
+                SESSION_META,
+                r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:00Z","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":58140501,"cached_input_tokens":55267712,"output_tokens":114278,"total_tokens":58254779},"last_token_usage":{"input_tokens":151839,"cached_input_tokens":146816,"output_tokens":621,"total_tokens":152460},"model_context_window":258400}}}"#,
+            ],
+        );
+        let result = parse_codex_jsonl(file.path()).unwrap();
+        assert_eq!(result.last_context_tokens, 151_839);
+        assert_eq!(result.context_window, 258_400);
+        assert!(result.last_context_tokens < result.context_window);
     }
 
     #[test]
@@ -1067,6 +1847,24 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_codex_rate_limits_ignores_model_specific_limits() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write_lines(
+            &mut file,
+            &[
+                SESSION_META,
+                r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:00Z","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1,"output_tokens":1},"last_token_usage":{"input_tokens":1,"output_tokens":1}},"rate_limits":{"limit_id":"codex","primary":{"used_percent":25.0,"window_minutes":300,"resets_at":1774686045},"secondary":{"used_percent":4.0,"window_minutes":10080,"resets_at":1775186466}}}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:01Z","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1,"output_tokens":1},"last_token_usage":{"input_tokens":1,"output_tokens":1}},"rate_limits":{"limit_id":"codex_bengalfox","limit_name":"GPT-5.3-Codex-Spark","primary":{"used_percent":0.0,"window_minutes":300,"resets_at":1774686045},"secondary":{"used_percent":0.0,"window_minutes":10080,"resets_at":1775186466}}}}"#,
+            ],
+        );
+
+        let result = parse_codex_jsonl(file.path()).unwrap();
+        let rl = result.rate_limit.expect("account rate_limit should remain");
+        assert_eq!(rl.five_hour_pct, Some(25.0));
+        assert_eq!(rl.seven_day_pct, Some(4.0));
+    }
+
+    #[test]
     fn test_parse_codex_cache_read_fallback_field_name() {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         write_lines(
@@ -1079,7 +1877,7 @@ mod tests {
         );
         let result = parse_codex_jsonl(file.path()).unwrap();
         assert_eq!(result.total_cache_read, 30);
-        assert_eq!(result.last_context_tokens, 25); // 20 + 5
+        assert_eq!(result.last_context_tokens, 20);
     }
 
     #[test]
@@ -1137,6 +1935,28 @@ mod tests {
         assert!(
             !result.model_generating,
             "agent_message must close the thinking window"
+        );
+    }
+
+    #[test]
+    fn test_parse_codex_chat_tail_from_user_and_agent_messages() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write_lines(
+            &mut file,
+            &[
+                SESSION_META,
+                r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:00Z","payload":{"type":"user_message","message":"check \u0007auth\u202E sk-proj-secret"}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-03-28T15:02:00Z","payload":{"type":"agent_message","message":"Auth guard\u0008 is the failing path."}}"#,
+            ],
+        );
+        let result = parse_codex_jsonl(file.path()).unwrap();
+        assert_eq!(result.chat_messages.len(), 2);
+        assert_eq!(result.chat_messages[0].role, ChatRole::User);
+        assert_eq!(result.chat_messages[0].text, "check auth [REDACTED]");
+        assert_eq!(result.chat_messages[1].role, ChatRole::Assistant);
+        assert_eq!(
+            result.chat_messages[1].text,
+            "Auth guard is the failing path."
         );
     }
 
@@ -1200,8 +2020,7 @@ mod tests {
 
         let (session, _) = collector
             .load_session_with_rate_limit(
-                Some(42),
-                false,
+                owned_process(42),
                 file.path(),
                 &process_info,
                 &HashMap::new(),
@@ -1249,8 +2068,7 @@ mod tests {
 
         let (session, _) = collector
             .load_session_with_rate_limit(
-                Some(42),
-                false,
+                owned_process(42),
                 file.path(),
                 &process_info,
                 &HashMap::new(),
@@ -1292,8 +2110,7 @@ mod tests {
 
         let (session, _) = collector
             .load_session_with_rate_limit(
-                Some(42),
-                false,
+                owned_process(42),
                 file.path(),
                 &process_info,
                 &HashMap::new(),
@@ -1337,8 +2154,7 @@ mod tests {
 
         let (session, _) = collector
             .load_session_with_rate_limit(
-                Some(42),
-                false,
+                owned_process(42),
                 file.path(),
                 &process_info,
                 &HashMap::new(),

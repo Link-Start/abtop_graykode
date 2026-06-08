@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -33,7 +33,7 @@ pub struct FileAccess {
 pub const MAX_FILE_ACCESSES: usize = 1000;
 
 /// Account-level rate limit info (shared across all sessions).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct RateLimitInfo {
     /// "claude" or "codex"
     pub source: String,
@@ -49,7 +49,7 @@ pub struct RateLimitInfo {
     pub updated_at: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum SessionStatus {
     /// Model is generating a response (last_user_ts_ms > 0)
     Thinking,
@@ -57,6 +57,8 @@ pub enum SessionStatus {
     Executing,
     /// Idle, waiting for user input or permission prompt
     Waiting,
+    /// Session appears recent, but process ownership is not confirmed
+    Unknown,
     /// Waiting due to rate limit
     RateLimited,
     /// Session finished
@@ -70,7 +72,7 @@ impl SessionStatus {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ChildProcess {
     pub pid: u32,
     pub command: String,
@@ -79,7 +81,7 @@ pub struct ChildProcess {
 }
 
 /// A port left open by a process whose parent session has ended.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct OrphanPort {
     pub port: u16,
     pub pid: u32,
@@ -104,6 +106,22 @@ pub struct ToolCall {
     /// Duration in milliseconds (0 if unknown).
     pub duration_ms: u64,
 }
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ChatRole {
+    User,
+    Assistant,
+}
+
+/// A compact, redacted chat line from the session transcript.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChatMessage {
+    pub role: ChatRole,
+    pub text: String,
+}
+
+/// Maximum chat messages kept per session to bound memory and UI noise.
+pub const MAX_CHAT_MESSAGES: usize = 12;
 
 #[derive(Debug, Clone)]
 pub struct AgentSession {
@@ -148,6 +166,8 @@ pub struct AgentSession {
     pub initial_prompt: String,
     /// First assistant response text (text blocks only) — used as summary fallback
     pub first_assistant_text: String,
+    /// Recent user/assistant chat tail, excluding tool results and tool inputs.
+    pub chat_messages: Vec<ChatMessage>,
     /// Timeline of tool calls extracted from transcript.
     pub tool_calls: Vec<ToolCall>,
     /// Unix-epoch ms of the assistant turn whose `tool_use` blocks are still
@@ -162,6 +182,10 @@ pub struct AgentSession {
     pub thinking_since_ms: u64,
     /// File access audit log: every file read/written/edited by the agent.
     pub file_accesses: Vec<FileAccess>,
+    /// Config root directory for this session's agent (home-abbreviated, e.g. "~/.claude-work").
+    /// For Claude Code: the active .claude* profile folder. For Codex: "~/.codex".
+    /// For OpenCode: the data directory containing opencode.db.
+    pub config_root: String,
 }
 
 impl AgentSession {
@@ -265,10 +289,12 @@ mod tests {
             children: Vec::new(),
             initial_prompt: String::new(),
             first_assistant_text: String::new(),
+            chat_messages: Vec::new(),
             tool_calls: Vec::new(),
             pending_since_ms: 0,
             thinking_since_ms: 0,
             file_accesses: Vec::new(),
+            config_root: String::new(),
         }
     }
 

@@ -1,7 +1,7 @@
 use super::process::{self, ProcInfo};
 use crate::model::{
-    AgentSession, ChildProcess, FileAccess, FileOp, SessionFile, SessionStatus, SubAgent,
-    MAX_FILE_ACCESSES,
+    AgentSession, ChatMessage, ChatRole, ChildProcess, FileAccess, FileOp, SessionFile,
+    SessionStatus, SubAgent, MAX_CHAT_MESSAGES, MAX_FILE_ACCESSES,
 };
 use serde_json::Value;
 use std::collections::HashMap;
@@ -49,22 +49,30 @@ struct ProcessOpenPaths {
 pub struct ClaudeCollector {
     /// All known config directories to scan for sessions.
     config_dirs: Vec<ConfigDir>,
+    /// User-configured Claude config directories from abtop config.
+    configured_config_dirs: Vec<PathBuf>,
     /// Cached transcript parse results keyed by session_id.
     /// On each tick, only new bytes since `new_offset` are parsed.
     transcript_cache: HashMap<String, TranscriptResult>,
 }
 
 impl ClaudeCollector {
+    #[cfg(test)]
     pub fn new() -> Self {
+        Self::with_configured_dirs(Vec::new())
+    }
+
+    pub fn with_configured_dirs(configured_config_dirs: Vec<PathBuf>) -> Self {
         Self {
             config_dirs: Vec::new(),
+            configured_config_dirs,
             transcript_cache: HashMap::new(),
         }
     }
 
-    /// Discover all unique Claude config directories by reading
-    /// /proc/<pid>/environ for each running Claude process.
-    /// Always includes the default (~/.claude) and CLAUDE_CONFIG_DIR if set.
+    /// Discover unique Claude config directories from defaults, configured
+    /// profile roots, home sibling profiles, and process environment/open-file
+    /// signals when the platform exposes them.
     fn refresh_config_dirs(&mut self, process_info: &HashMap<u32, process::ProcInfo>) {
         // BTreeSet for deterministic iteration order across runs.
         let mut seen = std::collections::BTreeSet::new();
@@ -72,6 +80,16 @@ impl ClaudeCollector {
         // Always include the default directory
         let default = dirs::home_dir().unwrap_or_default().join(".claude");
         seen.insert(default);
+
+        if let Some(home) = dirs::home_dir() {
+            seen.extend(discover_home_claude_config_dirs(&home));
+        }
+
+        for dir in &self.configured_config_dirs {
+            if is_claude_config_root(dir) {
+                seen.insert(dir.clone());
+            }
+        }
 
         // Include CLAUDE_CONFIG_DIR from abtop's own environment
         if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR") {
@@ -106,7 +124,8 @@ impl ClaudeCollector {
         }
 
         let self_pid = std::process::id();
-        let active_session_paths = self.discover_active_session_paths(&shared.process_info, self_pid);
+        let active_session_paths =
+            self.discover_active_session_paths(&shared.process_info, self_pid);
         let active_config_dirs: Vec<ConfigDir> = active_session_paths
             .iter()
             .map(|(_, config)| config.clone())
@@ -355,7 +374,7 @@ impl ClaudeCollector {
 
         if let Some(ref tp) = transcript_path {
             let cached = self.transcript_cache.remove(&sf.session_id);
-            // Detect file replacement: if inode or mtime changed, reparse from scratch
+            // Detect file replacement: if the file identity changed, reparse from scratch.
             let identity_changed = cached
                 .as_ref()
                 .map(|c| c.file_identity != file_identity(tp))
@@ -366,7 +385,20 @@ impl ClaudeCollector {
                 cached.as_ref().map(|c| c.new_offset).unwrap_or(0)
             };
 
-            let delta = parse_transcript(tp, from_offset);
+            let (initial_context_tokens, initial_cache_read) = if from_offset > 0 {
+                cached
+                    .as_ref()
+                    .map(|c| (c.last_context_tokens, c.prev_cache_read))
+                    .unwrap_or((0, 0))
+            } else {
+                (0, 0)
+            };
+            let delta = parse_transcript_with_previous(
+                tp,
+                from_offset,
+                initial_context_tokens,
+                initial_cache_read,
+            );
 
             if let Some(mut prev) = cached {
                 // File replaced, shrank, or first parse — replace entirely
@@ -387,6 +419,10 @@ impl ClaudeCollector {
                     if delta.max_context_tokens > prev.max_context_tokens {
                         prev.max_context_tokens = delta.max_context_tokens;
                     }
+                    if delta.last_context_tokens > 0 {
+                        prev.prev_cache_read = delta.prev_cache_read;
+                    }
+                    prev.compaction_count += delta.compaction_count;
                     prev.turn_count += delta.turn_count;
                     // Always update current_task from delta — empty means
                     // latest assistant turn had no tool_use (task cleared)
@@ -407,6 +443,11 @@ impl ClaudeCollector {
                         let remaining = 500 - prev.tool_calls.len();
                         prev.tool_calls
                             .extend(delta.tool_calls.into_iter().take(remaining));
+                    }
+                    prev.chat_messages.extend(delta.chat_messages);
+                    let len = prev.chat_messages.len();
+                    if len > MAX_CHAT_MESSAGES {
+                        prev.chat_messages.drain(..len - MAX_CHAT_MESSAGES);
                     }
                     // Only overwrite turn-state when the delta actually
                     // observed new user/assistant lines. A no-op tick (file
@@ -446,6 +487,7 @@ impl ClaudeCollector {
             total_cache_create: 0,
             last_context_tokens: 0,
             max_context_tokens: 0,
+            prev_cache_read: 0,
             context_history: Vec::new(),
             compaction_count: 0,
             turn_count: 0,
@@ -458,6 +500,7 @@ impl ClaudeCollector {
             token_history: Vec::new(),
             initial_prompt: String::new(),
             first_assistant_text: String::new(),
+            chat_messages: Vec::new(),
             tool_calls: Vec::new(),
             last_assistant_ts_ms: 0,
             last_user_ts_ms: 0,
@@ -485,6 +528,7 @@ impl ClaudeCollector {
         let compaction_count = cached.compaction_count;
         let initial_prompt = cached.initial_prompt.clone();
         let first_assistant_text = cached.first_assistant_text.clone();
+        let chat_messages = cached.chat_messages.clone();
         let tool_calls = cached.tool_calls.clone();
         let file_accesses = cached.file_accesses.clone();
 
@@ -624,10 +668,12 @@ impl ClaudeCollector {
             children,
             initial_prompt,
             first_assistant_text,
+            chat_messages,
             tool_calls,
             pending_since_ms: cached.last_assistant_ts_ms,
             thinking_since_ms: cached.last_user_ts_ms,
             file_accesses,
+            config_root: super::abbrev_path(&config.base_dir()),
         })
     }
 
@@ -741,6 +787,12 @@ impl ClaudeCollector {
         }
 
         (file_count, line_count)
+    }
+}
+
+impl Default for ClaudeCollector {
+    fn default() -> Self {
+        Self::with_configured_dirs(Vec::new())
     }
 }
 
@@ -944,6 +996,27 @@ fn is_claude_config_root(path: &Path) -> bool {
     path.join("sessions").is_dir() && path.join("projects").is_dir()
 }
 
+fn discover_home_claude_config_dirs(home: &Path) -> Vec<PathBuf> {
+    let mut roots = std::collections::BTreeSet::new();
+    let Ok(entries) = fs::read_dir(home) else {
+        return Vec::new();
+    };
+
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name != ".claude" && !name.starts_with(".claude-") {
+            continue;
+        }
+        let path = entry.path();
+        if is_claude_config_root(&path) {
+            roots.insert(path);
+        }
+    }
+
+    roots.into_iter().collect()
+}
+
 /// Per-tick session-discovery state shared across all `load_session` calls
 /// in a single `collect_sessions` pass. Pre-parsed so each PID can reason
 /// about the sids claimed by its neighbors without re-reading every
@@ -1140,6 +1213,8 @@ struct TranscriptResult {
     last_context_tokens: u64,
     /// High-water mark: largest context seen in any turn (for 1M detection)
     max_context_tokens: u64,
+    /// cache_read from the previous turn (for compaction detection)
+    prev_cache_read: u64,
     /// Per-turn context sizes for evolution visualization.
     context_history: Vec<u64>,
     /// Detected compaction events (context dropped > 30% between consecutive turns).
@@ -1157,6 +1232,8 @@ struct TranscriptResult {
     initial_prompt: String,
     /// First assistant response text (text blocks only, no tool_use)
     first_assistant_text: String,
+    /// Recent real chat messages, excluding tool_result wrappers and tool inputs.
+    chat_messages: Vec<ChatMessage>,
     /// Tool call timeline extracted from transcript.
     tool_calls: Vec<crate::model::ToolCall>,
     /// Timestamp of the last assistant turn (epoch ms), used to compute tool duration.
@@ -1182,21 +1259,12 @@ fn is_symlink(path: &Path) -> bool {
         .unwrap_or(true)
 }
 
-/// Get file identity as (inode, mtime_nanos) for detecting file replacement.
+/// Get file identity as (device, inode) for detecting file replacement.
 #[cfg(unix)]
 fn file_identity(path: &Path) -> (u64, u64) {
     fs::metadata(path)
         .ok()
-        .map(|m| {
-            let ino = m.ino();
-            let mtime_ns = m
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(0);
-            (ino, mtime_ns)
-        })
+        .map(|m| (m.dev(), m.ino()))
         .unwrap_or((0, 0))
 }
 
@@ -1218,6 +1286,15 @@ fn file_identity(path: &Path) -> (u64, u64) {
 }
 
 fn parse_transcript(path: &Path, from_offset: u64) -> TranscriptResult {
+    parse_transcript_with_previous(path, from_offset, 0, 0)
+}
+
+fn parse_transcript_with_previous(
+    path: &Path,
+    from_offset: u64,
+    initial_context_tokens: u64,
+    initial_cache_read: u64,
+) -> TranscriptResult {
     let identity = file_identity(path);
     let mut result = TranscriptResult {
         model: "-".to_string(),
@@ -1227,6 +1304,7 @@ fn parse_transcript(path: &Path, from_offset: u64) -> TranscriptResult {
         total_cache_create: 0,
         last_context_tokens: 0,
         max_context_tokens: 0,
+        prev_cache_read: 0,
         context_history: Vec::new(),
         compaction_count: 0,
         turn_count: 0,
@@ -1239,6 +1317,7 @@ fn parse_transcript(path: &Path, from_offset: u64) -> TranscriptResult {
         token_history: Vec::new(),
         initial_prompt: String::new(),
         first_assistant_text: String::new(),
+        chat_messages: Vec::new(),
         tool_calls: Vec::new(),
         last_assistant_ts_ms: 0,
         last_user_ts_ms: 0,
@@ -1264,6 +1343,16 @@ fn parse_transcript(path: &Path, from_offset: u64) -> TranscriptResult {
         from_offset
     };
     let from_offset = effective_offset;
+    let mut prev_context_tokens = if from_offset > 0 {
+        initial_context_tokens
+    } else {
+        0
+    };
+    let mut prev_cache_read = if from_offset > 0 {
+        initial_cache_read
+    } else {
+        0
+    };
 
     let mut reader = BufReader::new(file);
     if from_offset > 0 {
@@ -1368,21 +1457,31 @@ fn parse_transcript(path: &Path, from_offset: u64) -> TranscriptResult {
                                     // Exception: when cache_read = 0 but cache_creation > 0,
                                     // this is a fresh session creating cache for the first time,
                                     // so cache_creation represents the actual context size.
-                                    let prev_context = result.last_context_tokens;
-                                    result.last_context_tokens = if cr == 0 && cc > 0 {
+                                    let prev_context = prev_context_tokens;
+                                    let current_context = if cr == 0 && cc > 0 {
                                         inp + cc
                                     } else {
                                         inp + cr
                                     };
+                                    result.last_context_tokens = current_context;
                                     if result.last_context_tokens > result.max_context_tokens {
                                         result.max_context_tokens = result.last_context_tokens;
                                     }
                                     // Detect compaction: context drops > 30% between turns
+                                    // AND cache_read drops hard (old cache invalidated).
+                                    // This avoids false positives from normal cache hit rate
+                                    // fluctuations where total context varies but no
+                                    // actual conversation truncation occurred.
                                     if prev_context > 0
                                         && result.last_context_tokens < prev_context * 7 / 10
+                                        && prev_cache_read > 1000
+                                        && cr < prev_cache_read / 5
                                     {
                                         result.compaction_count += 1;
                                     }
+                                    prev_context_tokens = current_context;
+                                    prev_cache_read = cr;
+                                    result.prev_cache_read = cr;
                                     if result.context_history.len() < 10_000 {
                                         result.context_history.push(result.last_context_tokens);
                                     }
@@ -1419,6 +1518,14 @@ fn parse_transcript(path: &Path, from_offset: u64) -> TranscriptResult {
                                                 truncate(&normalized, 200);
                                         }
                                     }
+                                }
+                                let assistant_text = extract_chat_text(msg);
+                                if !assistant_text.is_empty() {
+                                    push_chat_message(
+                                        &mut result.chat_messages,
+                                        ChatRole::Assistant,
+                                        assistant_text,
+                                    );
                                 }
                                 // Extract all tool_use entries: timeline + current_task + file access audit
                                 let mut has_tool_use = false;
@@ -1503,15 +1610,20 @@ fn parse_transcript(path: &Path, from_offset: u64) -> TranscriptResult {
                                 result.last_assistant_ts_ms = 0;
                             }
                             // Mark the start of a thinking window — next assistant
-                            // turn clears it. **Skip tool_result wrappers**:
-                            // Claude Code serializes both real prompts and tool
-                            // results as `user`-role lines, but only real prompts
-                            // mean "model has been asked, no reply yet". A tool
-                            // loop alternates assistant(tool_use) ↔ user(tool_result)
-                            // inside one logical turn, and treating each
-                            // tool_result as the start of a new thinking window
-                            // makes the status flicker Think ↔ Wait per tool call.
-                            if entry_ts_ms > 0 && !is_tool_result_user_msg(val.get("message")) {
+                            // turn clears it. **Skip synthetic user lines**:
+                            // Claude Code serializes both real prompts and a number
+                            // of non-prompt entries (tool_result wrappers, slash
+                            // commands like /plugin, ! bash invocations, meta
+                            // caveats) as `user`-role lines. Only real prompts
+                            // mean "model has been asked, no reply yet"; the
+                            // others either belong inside an existing turn or
+                            // are pure local operations that never invoke the
+                            // model. Treating them as a thinking window pins
+                            // the session in Thinking forever (e.g. /plugin
+                            // update flushes 3 user-role lines and no
+                            // assistant reply ever arrives to clear them).
+                            let synthetic = is_synthetic_user_msg(&val);
+                            if entry_ts_ms > 0 && !synthetic {
                                 result.last_user_ts_ms = entry_ts_ms;
                             }
                             result.saw_turn = true;
@@ -1521,10 +1633,24 @@ fn parse_transcript(path: &Path, from_offset: u64) -> TranscriptResult {
                             if let Some(b) = val.get("gitBranch").and_then(|b| b.as_str()) {
                                 result.git_branch = b.to_string();
                             }
-                            // Extract first user prompt as session title
-                            if result.initial_prompt.is_empty() {
+                            // Extract first user prompt as session title — also
+                            // skip synthetic lines so the title isn't
+                            // "<command-name>/plugin..." or a bash stdout dump.
+                            if result.initial_prompt.is_empty() && !synthetic {
                                 if let Some(msg) = val.get("message") {
                                     result.initial_prompt = extract_prompt_text(msg);
+                                }
+                            }
+                            if !synthetic {
+                                if let Some(msg) = val.get("message") {
+                                    let user_text = extract_chat_text(msg);
+                                    if !user_text.is_empty() {
+                                        push_chat_message(
+                                            &mut result.chat_messages,
+                                            ChatRole::User,
+                                            user_text,
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -1552,25 +1678,104 @@ fn parse_transcript(path: &Path, from_offset: u64) -> TranscriptResult {
 /// Handles both string content and array-of-blocks content.
 /// Encode a cwd path to match Claude Code's project directory naming.
 /// Claude Code replaces '/', '_', and '.' with '-'.
-/// True iff a `user`-role transcript message is a tool_result wrapper
-/// (Claude Code returns tool outputs to the model as user-role messages
-/// whose content blocks are `{type: "tool_result", ...}`). Used to keep
-/// tool loops from flickering the Thinking status: only real prompts
-/// should open a new thinking window.
+/// True iff a `user`-role transcript entry is *synthetic* — i.e. not a
+/// real human prompt that the model still owes a reply for. Three forms:
 ///
-/// Conservative: returns true only when the message has content blocks
-/// AND every block is a tool_result. A mixed block message is treated
-/// as a real prompt so we never silently swallow user input.
-fn is_tool_result_user_msg(message: Option<&Value>) -> bool {
-    let Some(message) = message else { return false };
-    let Some(Value::Array(arr)) = message.get("content") else {
-        return false;
-    };
-    if arr.is_empty() {
-        return false;
+/// 1. `isMeta: true` — Claude Code's explicit marker for non-prompt
+///    entries (e.g. the `<local-command-caveat>` line).
+/// 2. `content` is an array and every block is `tool_result` — the
+///    user-role wrapper Claude Code uses to feed tool output back to
+///    the model. A mixed block message is treated as a real prompt so
+///    we never silently swallow user input.
+/// 3. `content` is a string opening with a known local-command tag —
+///    `/plugin`, `/exit`, `!bash`, etc. all serialize as user-role
+///    lines like `<command-name>...`, `<local-command-stdout>...`,
+///    `<bash-input>...`. These are pure local operations that never
+///    invoke the model, so treating them as a prompt would leave
+///    `last_user_ts_ms` stuck and pin the session in Thinking forever.
+fn is_synthetic_user_msg(entry: &Value) -> bool {
+    if entry.get("isMeta").and_then(|v| v.as_bool()).unwrap_or(false) {
+        return true;
     }
-    arr.iter()
-        .all(|block| block.get("type").and_then(|t| t.as_str()) == Some("tool_result"))
+    let Some(message) = entry.get("message") else { return false };
+    match message.get("content") {
+        Some(Value::Array(arr)) => {
+            !arr.is_empty()
+                && arr.iter().all(|block| {
+                    block.get("type").and_then(|t| t.as_str()) == Some("tool_result")
+                })
+        }
+        Some(Value::String(s)) => {
+            let t = s.trim_start();
+            t.starts_with("<local-command-stdout>")
+                || t.starts_with("<local-command-stderr>")
+                || t.starts_with("<local-command-caveat>")
+                || t.starts_with("<command-name>")
+                || t.starts_with("<bash-input>")
+                || t.starts_with("<bash-stdout>")
+                || t.starts_with("<bash-stderr>")
+        }
+        _ => false,
+    }
+}
+
+fn push_chat_message(messages: &mut Vec<ChatMessage>, role: ChatRole, text: String) {
+    if text.is_empty() {
+        return;
+    }
+    messages.push(ChatMessage { role, text });
+    let len = messages.len();
+    if len > MAX_CHAT_MESSAGES {
+        messages.drain(..len - MAX_CHAT_MESSAGES);
+    }
+}
+
+fn extract_chat_text(message: &Value) -> String {
+    let raw = match message.get("content") {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|block| {
+                if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+                    block
+                        .get("text")
+                        .and_then(|t| t.as_str())
+                        .map(|s| s.to_string())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+        _ => String::new(),
+    };
+    clean_chat_text(&raw, 500)
+}
+
+fn clean_chat_text(raw: &str, max: usize) -> String {
+    let cleaned = raw
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty() && !l.starts_with("```"))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let mut without_images = cleaned;
+    while let Some(start) = without_images.find("[Image") {
+        if let Some(end) = without_images[start..].find(']') {
+            without_images = format!(
+                "{}{}",
+                &without_images[..start],
+                without_images[start + end + 1..].trim_start()
+            );
+        } else {
+            break;
+        }
+    }
+
+    let terminal_safe = super::sanitize_terminal_text(without_images.trim());
+    let redacted = super::redact_secrets(&terminal_safe);
+    truncate(&redacted, max)
 }
 
 fn encode_cwd_path(cwd: &str) -> String {
@@ -1807,15 +2012,14 @@ fn read_env_var_from_proc(pid: u32, var_name: &str) -> Option<String> {
 /// Stub for non-Linux platforms where /proc is not available.
 /// Windows has no equivalent way to read another process's environment block
 /// without elevated privileges, so per-process `CLAUDE_CONFIG_DIR` overrides
-/// can't be detected — abtop's own env (resolved in `refresh_config_dirs`)
-/// is the only signal there.
+/// can't be detected. Configured roots, home sibling profile discovery, and
+/// abtop's own env are the portable signals there.
 ///
 /// On macOS, `ps eww`/`KERN_PROCARGS2` are unreliable: the kernel truncates
 /// the env block to ~120 chars for non-root callers, so `CLAUDE_CONFIG_DIR`
-/// is rarely visible. Discovery of profile sessions instead piggybacks on
-/// `libproc` open-FD inspection (see `discover_active_session_paths`), which
-/// reads the actual session-file paths a Claude process has open and infers
-/// the config dir from there.
+/// is rarely visible. Discovery of profile sessions can still use configured
+/// roots, home sibling profiles, and `libproc` open-FD inspection when Claude
+/// exposes session/project paths.
 #[cfg(not(target_os = "linux"))]
 fn read_env_var_from_proc(_pid: u32, _var_name: &str) -> Option<String> {
     None
@@ -1899,6 +2103,29 @@ mod tests {
         assert_eq!(result.last_user_ts_ms, 0);
         assert_eq!(result.last_assistant_ts_ms, 0);
         assert_eq!(result.new_offset, file_len);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_file_identity_is_stable_across_append() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write_lines(
+            &mut file,
+            &[r#"{"type":"assistant","message":{"usage":{"input_tokens":1}}}"#],
+        );
+        let before = file_identity(file.path());
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        write_lines(
+            &mut file,
+            &[r#"{"type":"assistant","message":{"usage":{"input_tokens":2}}}"#],
+        );
+        let after = file_identity(file.path());
+
+        assert_eq!(
+            before, after,
+            "appending to an existing transcript must keep the same file identity so the collector can tail new bytes"
+        );
     }
 
     #[test]
@@ -2042,6 +2269,56 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_transcript_slash_command_does_not_open_thinking_window() {
+        // Regression: `/plugin update` (and other pure-local slash commands)
+        // flush 2-3 user-role lines into the transcript and never produce an
+        // assistant reply. Before the fix, the trailing `<local-command-stdout>`
+        // line set last_user_ts_ms and the session was pinned in Thinking
+        // forever (Think generating reply). All three line shapes must be
+        // treated as synthetic.
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write_lines(&mut file, &[
+            // Real prompt + assistant reply to seed a clean Wait state.
+            r#"{"type":"user","timestamp":"2026-03-28T15:00:00Z","message":{"role":"user","content":"hi"}}"#,
+            r#"{"type":"assistant","timestamp":"2026-03-28T15:00:01Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"hello"}]}}"#,
+            // The three user-role lines `/plugin update` writes:
+            r#"{"type":"user","timestamp":"2026-03-28T15:01:00Z","isMeta":true,"message":{"role":"user","content":"<local-command-caveat>Caveat: ...</local-command-caveat>"}}"#,
+            r#"{"type":"user","timestamp":"2026-03-28T15:01:00Z","message":{"role":"user","content":"<command-name>/plugin</command-name>\n<command-args>update foo</command-args>"}}"#,
+            r#"{"type":"user","timestamp":"2026-03-28T15:01:00Z","message":{"role":"user","content":"<local-command-stdout>Updated foo</local-command-stdout>"}}"#,
+        ]);
+
+        let result = parse_transcript(file.path(), 0);
+
+        assert!(result.saw_turn);
+        assert_eq!(
+            result.last_user_ts_ms, 0,
+            "/plugin local-command lines must not reopen the thinking window",
+        );
+        // Title must come from the real prompt, not the synthetic lines.
+        assert_eq!(result.initial_prompt, "hi");
+    }
+
+    #[test]
+    fn test_parse_transcript_bash_input_does_not_open_thinking_window() {
+        // `!ls` and friends serialize as <bash-input>/<bash-stdout> user-role
+        // lines with no assistant reply. Same failure mode as /plugin.
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write_lines(&mut file, &[
+            r#"{"type":"assistant","timestamp":"2026-03-28T15:00:00Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"ok"}]}}"#,
+            r#"{"type":"user","timestamp":"2026-03-28T15:00:05Z","message":{"role":"user","content":"<bash-input>ls</bash-input>"}}"#,
+            r#"{"type":"user","timestamp":"2026-03-28T15:00:05Z","message":{"role":"user","content":"<bash-stdout>a\nb</bash-stdout><bash-stderr></bash-stderr>"}}"#,
+        ]);
+
+        let result = parse_transcript(file.path(), 0);
+
+        assert!(result.saw_turn);
+        assert_eq!(
+            result.last_user_ts_ms, 0,
+            "<bash-input>/<bash-stdout> lines must not reopen the thinking window",
+        );
+    }
+
+    #[test]
     fn test_parse_lsof_process_info_captures_multiple_pids_and_cwd() {
         let output = "\
 p111
@@ -2118,6 +2395,44 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
 
         assert_eq!(configs.len(), 1);
         assert_eq!(configs[0].base_dir(), profile);
+    }
+
+    #[test]
+    fn test_discover_home_claude_config_dirs_finds_profile_siblings() {
+        let temp = tempfile::tempdir().unwrap();
+        let personal = temp.path().join(".claude-personal");
+        let work = temp.path().join(".claude-work-team");
+        let incomplete = temp.path().join(".claude-cache");
+        std::fs::create_dir_all(personal.join("sessions")).unwrap();
+        std::fs::create_dir_all(personal.join("projects")).unwrap();
+        std::fs::create_dir_all(work.join("sessions")).unwrap();
+        std::fs::create_dir_all(work.join("projects")).unwrap();
+        std::fs::create_dir_all(incomplete.join("sessions")).unwrap();
+
+        let discovered = discover_home_claude_config_dirs(temp.path());
+
+        assert!(discovered.contains(&personal));
+        assert!(discovered.contains(&work));
+        assert!(!discovered.contains(&incomplete));
+    }
+
+    #[test]
+    fn test_refresh_config_dirs_includes_configured_profile_roots() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = temp.path().join(".claude-personal");
+        std::fs::create_dir_all(profile.join("sessions")).unwrap();
+        std::fs::create_dir_all(profile.join("projects")).unwrap();
+
+        let mut collector = ClaudeCollector::with_configured_dirs(vec![profile.clone()]);
+        collector.refresh_config_dirs(&HashMap::new());
+
+        assert!(
+            collector
+                .config_dirs
+                .iter()
+                .any(|config| config.base_dir() == profile),
+            "configured Claude profile root was not retained"
+        );
     }
 
     #[test]
@@ -2524,6 +2839,83 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
     }
 
     #[test]
+    fn test_load_session_detects_incremental_compaction_across_cached_boundary() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = temp.path().join(".claude");
+        let sessions = profile.join("sessions");
+        let projects = profile.join("projects");
+        let cwd = temp.path().join("repo");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let pid = 5252;
+        let session_id = "session-5252";
+        let session_path = sessions.join(format!("{}.json", pid));
+        write_session_file(&session_path, pid, session_id, &cwd);
+
+        let transcript_dir = projects.join(encode_cwd_path(cwd.to_str().unwrap()));
+        std::fs::create_dir_all(&transcript_dir).unwrap();
+        let transcript_path = transcript_dir.join(format!("{}.jsonl", session_id));
+        std::fs::write(
+            &transcript_path,
+            r#"{"type":"user","timestamp":"2026-03-28T15:00:00Z","message":{"role":"user","content":"start"}}
+{"type":"assistant","timestamp":"2026-03-28T15:00:05Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":100000,"output_tokens":50,"cache_read_input_tokens":100000,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"first"}]}}
+"#,
+        )
+        .unwrap();
+
+        let mut collector = ClaudeCollector::new();
+        let process_info = make_proc_info(pid, "claude");
+        let children_map = HashMap::new();
+        let ports = HashMap::new();
+        let config = ConfigDir::new(profile);
+        let ctx =
+            build_discovery_context(&[(session_path.clone(), config.clone())], &process_info, 0);
+
+        let first = collector
+            .load_session(
+                &session_path,
+                &config,
+                &process_info,
+                &children_map,
+                &ports,
+                &ctx,
+            )
+            .unwrap();
+        assert_eq!(first.compaction_count, 0);
+
+        let mut transcript = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript_path)
+            .unwrap();
+        writeln!(
+            transcript,
+            r#"{{"type":"user","timestamp":"2026-03-28T15:01:00Z","message":{{"role":"user","content":"continue"}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            transcript,
+            r#"{{"type":"assistant","timestamp":"2026-03-28T15:01:05Z","message":{{"model":"claude-sonnet-4-6","usage":{{"input_tokens":20000,"output_tokens":30,"cache_read_input_tokens":100,"cache_creation_input_tokens":0}},"content":[{{"type":"text","text":"after compact"}}]}}}}"#
+        )
+        .unwrap();
+        transcript.flush().unwrap();
+
+        let second = collector
+            .load_session(
+                &session_path,
+                &config,
+                &process_info,
+                &children_map,
+                &ports,
+                &ctx,
+            )
+            .unwrap();
+
+        assert_eq!(second.compaction_count, 1);
+    }
+
+    #[test]
     fn test_parse_transcript_basic_tokens() {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         write_lines(
@@ -2560,6 +2952,31 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
         assert_eq!(result.total_input, 300); // 100 + 200
         assert_eq!(result.total_output, 130); // 50 + 80
         assert_eq!(result.token_history.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_transcript_chat_tail_skips_tool_results() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write_lines(
+            &mut file,
+            &[
+                r#"{"type":"user","timestamp":"2026-03-28T15:00:00Z","message":{"role":"user","content":"fi\u0007x login\u202E"}}"#,
+                r#"{"type":"assistant","timestamp":"2026-03-28T15:00:05Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"I'll inspect\u0008 auth."},{"type":"tool_use","name":"Read","input":{"file_path":"src/auth.rs"}}]}}"#,
+                r#"{"type":"user","timestamp":"2026-03-28T15:00:06Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"secret output"}]}}"#,
+                r#"{"type":"assistant","timestamp":"2026-03-28T15:00:10Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"Root cause is the guard."}]}}"#,
+            ],
+        );
+        let result = parse_transcript(file.path(), 0);
+        assert_eq!(result.chat_messages.len(), 3);
+        assert_eq!(result.chat_messages[0].role, ChatRole::User);
+        assert_eq!(result.chat_messages[0].text, "fix login");
+        assert_eq!(result.chat_messages[1].role, ChatRole::Assistant);
+        assert_eq!(result.chat_messages[1].text, "I'll inspect auth.");
+        assert_eq!(result.chat_messages[2].text, "Root cause is the guard.");
+        assert!(result
+            .chat_messages
+            .iter()
+            .all(|msg| !msg.text.contains("secret output")));
     }
 
     #[test]

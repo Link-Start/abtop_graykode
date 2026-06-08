@@ -1,6 +1,6 @@
 use crate::app::App;
 use crate::locale::t;
-use crate::model::{AgentSession, FileOp};
+use crate::model::{AgentSession, ChatRole, FileOp};
 use crate::theme::Theme;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -8,11 +8,21 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Paragraph, Row, Table};
 use ratatui::Frame;
 
-use super::{btop_block, fmt_mem_kb, fmt_tokens, grad_at, make_gradient, truncate_str};
+use super::{btop_block_active, fmt_mem_kb, fmt_tokens, grad_at, make_gradient, truncate_str};
 
 pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
+    draw_sessions_panel_active(f, app, area, theme, false);
+}
+
+pub(crate) fn draw_sessions_panel_active(
+    f: &mut Frame,
+    app: &App,
+    area: Rect,
+    theme: &Theme,
+    active: bool,
+) {
     // Render the outer block
-    let block = btop_block("sessions", "⁶", theme.proc_box, theme);
+    let block = btop_block_active("sessions", "⁶", theme.proc_box, theme, active);
     f.render_widget(block, area);
 
     let inner = Rect {
@@ -36,6 +46,8 @@ pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &
         .sum();
     let detail_reserve: u16 = if app.show_timeline {
         (inner.height * 2 / 3).min(inner.height.saturating_sub(5))
+    } else if inner.height <= 12 {
+        6.min(inner.height.saturating_sub(3))
     } else {
         10.min(inner.height / 2)
     };
@@ -69,20 +81,23 @@ pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &
     );
     let mut rows = Vec::new();
 
-    // Responsive columns — 9 core columns always visible, widths shrink at narrow terminals.
-    // Only Memory/Turn/Pid are hidden when truly narrow.
+    // Responsive columns: keep the identity, current task, status, and context
+    // visible first; add lower-value columns back as width allows.
     let w = inner.width;
     let show_pid = w >= 120;
-    let show_memory = w >= 100;
-    let show_turn = w >= 100;
+    let show_session_id = w >= 76;
+    let show_config = w >= 100;
+    let show_model = w >= 90;
+    let show_tokens = w >= 86;
+    let show_memory = w >= 110;
+    let show_turn = w >= 110;
 
-    // Responsive widths — all 9 core columns always visible, widths adapt
     let project_w: u16 = if w >= 120 {
         14
-    } else if w >= 100 {
+    } else if w >= 80 {
         10
     } else {
-        7
+        8
     };
     let session_w: u16 = if w >= 110 { 9 } else { 5 };
     let session_label = if w >= 110 {
@@ -90,9 +105,21 @@ pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &
     } else {
         t("col.sess")
     };
-    let status_w: u16 = if w >= 100 { 8 } else { 6 };
+    let config_w: u16 = if w >= 110 { 14 } else { 10 };
+    let config_label = if w >= 110 {
+        t("col.config")
+    } else {
+        t("col.cfg")
+    };
+    let status_w: u16 = if w >= 100 {
+        8
+    } else if w >= 72 {
+        6
+    } else {
+        3
+    };
     let model_w: u16 = if w >= 110 { 13 } else { 10 };
-    let context_w: u16 = if w >= 100 { 7 } else { 5 };
+    let context_w: u16 = if w >= 100 { 7 } else { 4 };
     let context_label = if w >= 100 {
         t("col.context")
     } else {
@@ -107,8 +134,9 @@ pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &
         let marker = if selected { "►" } else { " " };
 
         let (agent_label, agent_color) = match session.agent_cli {
-            "claude" => ("*CC", Color::Rgb(217, 119, 87)), // #D97757 terracotta
-            "codex" => (">CD", Color::Rgb(122, 157, 255)), // #7A9DFF periwinkle
+            "claude"   => ("*CC", Color::Rgb(217, 119, 87)),  // #D97757 terracotta
+            "codex"    => (">CD", Color::Rgb(122, 157, 255)), // #7A9DFF periwinkle
+            "opencode" => ("#OC", Color::Rgb(74, 222, 128)),  // #4ADE80 emerald
             other => {
                 let fallback: String = other.chars().take(3).collect::<String>().to_uppercase();
                 (
@@ -122,11 +150,12 @@ pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &
             crate::model::SessionStatus::Thinking => (t("sess.think"), theme.proc_misc),
             crate::model::SessionStatus::Executing => (t("sess.exec"), theme.hi_fg),
             crate::model::SessionStatus::Waiting => (t("sess.wait"), grad_at(&proc_grad, 50.0)),
+            crate::model::SessionStatus::Unknown => (t("sess.unknown"), theme.inactive_fg),
             crate::model::SessionStatus::RateLimited => (t("sess.rate"), theme.status_fg),
             crate::model::SessionStatus::Done => (t("sess.done"), theme.inactive_fg),
         };
 
-        let is_1m = session.total_tokens() > 200_000 || session.model.contains("[1m]");
+        let is_1m = session.context_window >= 1_000_000 || session.model.contains("[1m]");
         let model_short = shorten_model(&session.model, is_1m);
         let ctx_color = grad_at(&proc_grad, session.context_percent);
 
@@ -150,7 +179,6 @@ pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &
 
         let summary_col = app.session_summary(session);
 
-        // Build cells — 9 core columns always present, only Pid/Memory/Turn conditional
         let mut cells = vec![
             Cell::from(Span::styled(marker, Style::default().fg(theme.hi_fg))),
             Cell::from(Span::styled(agent_label, Style::default().fg(agent_color))),
@@ -161,40 +189,52 @@ pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &
                 Style::default().fg(theme.inactive_fg),
             )));
         }
-        cells.extend([
-            Cell::from(Span::styled(
-                truncate_str(&session.project_name, project_w as usize),
-                Style::default().fg(theme.title),
-            )),
-            Cell::from(Span::styled(
+        cells.push(Cell::from(Span::styled(
+            truncate_str(&session.project_name, project_w as usize),
+            Style::default().fg(theme.title),
+        )));
+        if show_session_id {
+            cells.push(Cell::from(Span::styled(
                 truncate_str(sid_short, session_w as usize),
                 Style::default().fg(theme.session_id),
-            )),
+            )));
+        }
+        if show_config {
+            cells.push(Cell::from(Span::styled(
+                truncate_str(&session.config_root, config_w as usize),
+                Style::default().fg(theme.inactive_fg),
+            )));
+        }
+        cells.extend([
             Cell::from(Span::styled(
-                summary_col,
+                truncate_str(&summary_col, w.saturating_sub(24) as usize),
                 Style::default().fg(theme.main_fg),
             )),
             Cell::from(Span::styled(
                 truncate_str(&status_icon_str, status_w as usize),
                 Style::default().fg(status_color),
             )),
-            Cell::from(Span::styled(
+        ]);
+        if show_model {
+            cells.push(Cell::from(Span::styled(
                 truncate_str(&model_short, model_w as usize),
                 Style::default().fg(if model_short == "-" {
                     theme.inactive_fg
                 } else {
                     theme.graph_text
                 }),
-            )),
-            Cell::from(Span::styled(
-                format!("{:.0}%", session.context_percent),
-                Style::default().fg(ctx_color),
-            )),
-            Cell::from(Span::styled(
+            )));
+        }
+        cells.push(Cell::from(Span::styled(
+            format!("{:.0}%", session.context_percent),
+            Style::default().fg(ctx_color),
+        )));
+        if show_tokens {
+            cells.push(Cell::from(Span::styled(
                 fmt_tokens(session.total_tokens()),
                 Style::default().fg(theme.main_fg),
-            )),
-        ]);
+            )));
+        }
         if show_memory {
             cells.push(Cell::from(Span::styled(
                 if session.mem_mb > 0 {
@@ -215,8 +255,16 @@ pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &
         rows.push(Row::new(cells).style(row_style).height(1));
 
         // 2nd line: task text in Summary column
-        let summary_idx = if show_pid { 5 } else { 4 };
-        let total_cols = 9 + show_pid as usize + show_memory as usize + show_turn as usize;
+        let summary_idx =
+            3 + show_pid as usize + show_session_id as usize + show_config as usize;
+        let total_cols = 6
+            + show_pid as usize
+            + show_session_id as usize
+            + show_config as usize
+            + show_model as usize
+            + show_tokens as usize
+            + show_memory as usize
+            + show_turn as usize;
         let task_cells: Vec<Cell> = (0..total_cols)
             .map(|j| {
                 if j == summary_idx {
@@ -258,21 +306,30 @@ pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &
                 if show_pid {
                     sa_cells.push(Cell::from(""));
                 }
+                sa_cells.push(Cell::from(Span::styled(
+                    truncate_str(&sa.name, project_w as usize),
+                    Style::default().fg(theme.graph_text),
+                )));
+                if show_session_id {
+                    sa_cells.push(Cell::from(""));
+                }
+                if show_config {
+                    sa_cells.push(Cell::from(""));
+                }
                 sa_cells.extend([
-                    Cell::from(Span::styled(
-                        truncate_str(&sa.name, project_w as usize),
-                        Style::default().fg(theme.graph_text),
-                    )),
-                    Cell::from(""),
                     Cell::from(""),
                     Cell::from(Span::styled(icon, Style::default().fg(sa_fg))),
-                    Cell::from(""),
-                    Cell::from(""),
-                    Cell::from(Span::styled(
+                ]);
+                if show_model {
+                    sa_cells.push(Cell::from(""));
+                }
+                sa_cells.push(Cell::from(""));
+                if show_tokens {
+                    sa_cells.push(Cell::from(Span::styled(
                         fmt_tokens(sa.tokens),
                         Style::default().fg(theme.graph_text),
-                    )),
-                ]);
+                    )));
+                }
                 if show_memory {
                     sa_cells.push(Cell::from(""));
                 }
@@ -294,15 +351,24 @@ pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &
     if show_pid {
         header_cells.push(Cell::from(Span::styled(t("col.pid"), header_style)));
     }
+    header_cells.push(Cell::from(Span::styled(t("col.project"), header_style)));
+    if show_session_id {
+        header_cells.push(Cell::from(Span::styled(session_label, header_style)));
+    }
+    if show_config {
+        header_cells.push(Cell::from(Span::styled(config_label, header_style)));
+    }
     header_cells.extend([
-        Cell::from(Span::styled(t("col.project"), header_style)),
-        Cell::from(Span::styled(session_label, header_style)),
         Cell::from(Span::styled(t("col.summary"), header_style)),
         Cell::from(Span::styled(t("col.status"), header_style)),
-        Cell::from(Span::styled(t("col.model"), header_style)),
-        Cell::from(Span::styled(context_label, header_style)),
-        Cell::from(Span::styled(t("col.tokens"), header_style)),
     ]);
+    if show_model {
+        header_cells.push(Cell::from(Span::styled(t("col.model"), header_style)));
+    }
+    header_cells.push(Cell::from(Span::styled(context_label, header_style)));
+    if show_tokens {
+        header_cells.push(Cell::from(Span::styled(t("col.tokens"), header_style)));
+    }
     if show_memory {
         header_cells.push(Cell::from(Span::styled(t("col.memory"), header_style)));
     }
@@ -318,15 +384,22 @@ pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &
     if show_pid {
         widths_vec.push(Constraint::Length(6)); // pid
     }
-    widths_vec.extend([
-        Constraint::Length(project_w), // project
-        Constraint::Length(session_w), // session id
-        Constraint::Fill(1),           // summary (fills remaining)
-        Constraint::Length(status_w),  // status
-        Constraint::Length(model_w),   // model
-        Constraint::Length(context_w), // context
-        Constraint::Length(tokens_w),  // tokens
-    ]);
+    widths_vec.push(Constraint::Length(project_w)); // project
+    if show_session_id {
+        widths_vec.push(Constraint::Length(session_w)); // session id
+    }
+    if show_config {
+        widths_vec.push(Constraint::Length(config_w)); // config root
+    }
+    widths_vec.push(Constraint::Fill(1)); // summary (fills remaining)
+    widths_vec.push(Constraint::Length(status_w)); // status
+    if show_model {
+        widths_vec.push(Constraint::Length(model_w)); // model
+    }
+    widths_vec.push(Constraint::Length(context_w)); // context
+    if show_tokens {
+        widths_vec.push(Constraint::Length(tokens_w)); // tokens
+    }
     if show_memory {
         widths_vec.push(Constraint::Length(8)); // memory
     }
@@ -457,20 +530,30 @@ pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &
         let has_children = !session.children.is_empty();
         let has_subagents = !session.subagents.is_empty();
         let has_tool_calls = !session.tool_calls.is_empty();
+        let has_chat = !session.chat_messages.is_empty();
+        let has_left_detail = has_children || has_subagents;
         let has_file_audit = app.show_file_audit && !session.file_accesses.is_empty();
         // Focus mode: file audit (F) takes priority over timeline (L) when both
         // are toggled on. Only one "full lower" mode is active at a time.
         let file_audit_focused = has_file_audit;
         let timeline_focused = !file_audit_focused && app.show_timeline && has_tool_calls;
-        // Default split: when neither focus mode is active, show a compact
-        // timeline in the right half of the lower area - but only if the
-        // terminal is wide enough that both halves remain readable
-        // (draw_timeline reserves 42 cols for labels).
+        // Default detail is chat when available; otherwise fall back to the
+        // compact timeline split. Both modes split when there is useful
+        // left-side detail (children/subagents) on a wide enough terminal,
+        // and use the whole lower area otherwise.
+        const CHAT_SPLIT_MIN_WIDTH: u16 = 120;
+        let chat_default = !file_audit_focused && !app.show_timeline && has_chat;
+        let chat_side_by_side =
+            chat_default && has_left_detail && detail_body.width >= CHAT_SPLIT_MIN_WIDTH;
+        let chat_full_width = chat_default && !chat_side_by_side;
         const TIMELINE_SPLIT_MIN_WIDTH: u16 = 120;
-        let timeline_side_by_side = !file_audit_focused
+        let timeline_default = !file_audit_focused
             && !app.show_timeline
+            && !chat_default
             && has_tool_calls
             && detail_body.width >= TIMELINE_SPLIT_MIN_WIDTH;
+        let timeline_side_by_side = timeline_default && has_left_detail;
+        let timeline_full_width = timeline_default && !has_left_detail;
 
         // Always show SESSION header (task) at top, then children/subagents/timeline/file_audit below
         let session_header_h: u16 = {
@@ -482,6 +565,9 @@ pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &
         };
         let has_lower = file_audit_focused
             || timeline_focused
+            || chat_full_width
+            || chat_side_by_side
+            || timeline_full_width
             || timeline_side_by_side
             || has_children
             || has_subagents;
@@ -498,12 +584,20 @@ pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &
         // SESSION header — always rendered
         {
             let mut lines = Vec::new();
+            let sid_short = if session.session_id.len() >= 8 {
+                &session.session_id[..8]
+            } else {
+                &session.session_id
+            };
+            let session_ref = if header_area.width <= 80 {
+                format!("►{} · {}", sid_short, session.project_name)
+            } else {
+                format!("►{} · {}", session.session_id, session.cwd)
+            };
             lines.push(Line::from(Span::styled(
-                format!(
-                    " {} (►{} · {})",
-                    t("detail.session").as_str(),
-                    &session.session_id,
-                    &session.cwd
+                truncate_str(
+                    &format!(" {} ({})", t("detail.session").as_str(), session_ref),
+                    header_area.width as usize,
                 ),
                 Style::default()
                     .fg(theme.title)
@@ -528,19 +622,19 @@ pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &
         // Layout below the session header:
         //   - file audit focus (F): full-width file audit
         //   - timeline focus (L): full-width timeline
-        //   - wide terminal with tool calls: left = children/subagents, right = compact timeline
+        //   - default chat: full-width, or split with children/subagents on wide terminals
+        //   - wide terminal with left detail + tool calls: split lower area
+        //   - wide terminal with only tool calls: full-width timeline
         //   - otherwise: children/subagents only (or nothing)
         if let Some(lower) = lower_area {
             if file_audit_focused {
                 draw_file_audit(f, session, lower, theme);
-            } else if timeline_focused {
+            } else if timeline_focused || timeline_full_width {
                 draw_timeline(f, session, lower, theme, app.timeline_scroll);
+            } else if chat_full_width {
+                draw_chat_history(f, session, lower, theme);
             } else {
-                // Split 50/50 whenever the side-by-side timeline is active, even if
-                // there's no left content - consistent layout beats saving the empty
-                // half, and sessions that gain/lose children at runtime shouldn't
-                // make the timeline flicker between full- and half-width.
-                let (left_area, right_timeline_area) = if timeline_side_by_side {
+                let (left_area, right_detail_area) = if chat_side_by_side || timeline_side_by_side {
                     let split = Layout::default()
                         .direction(Direction::Horizontal)
                         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
@@ -550,16 +644,33 @@ pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &
                     (lower, None)
                 };
 
-                if let Some(tl_area) = right_timeline_area {
-                    draw_timeline(f, session, tl_area, theme, app.timeline_scroll);
+                if let Some(detail_area) = right_detail_area {
+                    if chat_side_by_side {
+                        draw_chat_history(f, session, detail_area, theme);
+                    } else {
+                        draw_timeline(f, session, detail_area, theme, app.timeline_scroll);
+                    }
                 }
 
                 if has_children || has_subagents {
                     let body_chunks = if has_children && has_subagents {
-                        Layout::default()
-                            .direction(Direction::Horizontal)
-                            .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
-                            .split(left_area)
+                        if left_area.width < 90 {
+                            Layout::default()
+                                .direction(Direction::Vertical)
+                                .constraints([
+                                    Constraint::Percentage(50),
+                                    Constraint::Percentage(50),
+                                ])
+                                .split(left_area)
+                        } else {
+                            Layout::default()
+                                .direction(Direction::Horizontal)
+                                .constraints([
+                                    Constraint::Percentage(45),
+                                    Constraint::Percentage(55),
+                                ])
+                                .split(left_area)
+                        }
                     } else {
                         Layout::default()
                             .direction(Direction::Horizontal)
@@ -785,6 +896,45 @@ pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &
     }
 }
 
+/// Render the recent user/assistant chat tail for the selected session.
+fn draw_chat_history(f: &mut Frame, session: &AgentSession, area: Rect, theme: &Theme) {
+    if session.chat_messages.is_empty() {
+        return;
+    }
+
+    let mut lines = Vec::new();
+    lines.push(Line::from(Span::styled(
+        format!(
+            " {} ({})",
+            t("detail.chat").as_str(),
+            session.chat_messages.len()
+        ),
+        Style::default()
+            .fg(theme.title)
+            .add_modifier(Modifier::BOLD),
+    )));
+
+    let visible_rows = area.height.saturating_sub(1) as usize;
+    let start = session.chat_messages.len().saturating_sub(visible_rows);
+    let text_w = (area.width as usize).saturating_sub(6);
+
+    for msg in session.chat_messages.iter().skip(start) {
+        let (label, color) = match msg.role {
+            ChatRole::User => ("U", theme.hi_fg),
+            ChatRole::Assistant => ("A", theme.proc_misc),
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {} ", label), Style::default().fg(color)),
+            Span::styled(
+                truncate_str(&msg.text, text_w),
+                Style::default().fg(theme.main_fg),
+            ),
+        ]));
+    }
+
+    f.render_widget(Paragraph::new(lines), area);
+}
+
 /// Render the file access audit log in the given area.
 fn draw_file_audit(f: &mut Frame, session: &AgentSession, area: Rect, theme: &Theme) {
     use std::collections::HashSet;
@@ -889,27 +1039,6 @@ fn tool_label(name: &str) -> &str {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn codex_exec_command_uses_bash_color() {
-        let theme = Theme::default();
-        assert_eq!(
-            tool_color("exec_command", &theme),
-            tool_color("Bash", &theme)
-        );
-    }
-
-    #[test]
-    fn codex_tool_labels_fit_timeline_name_column() {
-        assert_eq!(tool_label("exec_command"), "Exec");
-        assert_eq!(tool_label("update_plan"), "Plan");
-        assert!(tool_label("exec_command").len() <= 6);
-    }
-}
-
 fn fmt_duration(ms: u64) -> String {
     if ms >= 60_000 {
         format!("{}m{:.0}s", ms / 60_000, (ms % 60_000) as f64 / 1000.0)
@@ -934,6 +1063,7 @@ fn draw_timeline(
             crate::model::SessionStatus::Thinking
                 | crate::model::SessionStatus::Executing
                 | crate::model::SessionStatus::Waiting
+                | crate::model::SessionStatus::Unknown
         );
     if tool_calls.is_empty() && !is_thinking {
         return;
@@ -1111,4 +1241,101 @@ fn draw_timeline(
     }
 
     f.render_widget(Paragraph::new(lines), area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::PanelVisibility;
+    use crate::model::SessionStatus;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    #[test]
+    fn codex_exec_command_uses_bash_color() {
+        let theme = Theme::default();
+        assert_eq!(
+            tool_color("exec_command", &theme),
+            tool_color("Bash", &theme)
+        );
+    }
+
+    #[test]
+    fn codex_tool_labels_fit_timeline_name_column() {
+        assert_eq!(tool_label("exec_command"), "Exec");
+        assert_eq!(tool_label("update_plan"), "Plan");
+        assert!(tool_label("exec_command").len() <= 6);
+    }
+
+    #[test]
+    fn codex_non_1m_context_window_does_not_show_1m_suffix() {
+        let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+        app.sessions.push(AgentSession {
+            agent_cli: "codex",
+            pid: 42,
+            session_id: "codex-session".into(),
+            cwd: "/tmp/project".into(),
+            project_name: "project".into(),
+            started_at: 0,
+            status: SessionStatus::Waiting,
+            model: "gpt-5".into(),
+            effort: String::new(),
+            context_percent: 58.7,
+            total_input_tokens: 1_000,
+            total_output_tokens: 500,
+            total_cache_read: 0,
+            total_cache_create: 0,
+            turn_count: 1,
+            current_tasks: vec!["waiting for input".into()],
+            mem_mb: 0,
+            version: String::new(),
+            git_branch: String::new(),
+            git_added: 0,
+            git_modified: 0,
+            token_history: Vec::new(),
+            context_history: Vec::new(),
+            compaction_count: 0,
+            context_window: 258_400,
+            subagents: Vec::new(),
+            mem_file_count: 0,
+            mem_line_count: 0,
+            children: Vec::new(),
+            initial_prompt: "prompt".into(),
+            first_assistant_text: String::new(),
+            chat_messages: Vec::new(),
+            tool_calls: Vec::new(),
+            pending_since_ms: 0,
+            thinking_since_ms: 0,
+            file_accesses: Vec::new(),
+            config_root: String::new(),
+        });
+
+        let backend = TestBackend::new(120, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                draw_sessions_panel(
+                    f,
+                    &app,
+                    Rect {
+                        x: 0,
+                        y: 0,
+                        width: 120,
+                        height: 20,
+                    },
+                    &app.theme,
+                )
+            })
+            .unwrap();
+        let text = format!("{}", terminal.backend());
+
+        assert!(
+            text.contains("gpt5"),
+            "model should render in session row\n{text}"
+        );
+        assert!(
+            !text.contains("[1m]"),
+            "non-1M Codex context windows must not be labeled as 1M\n{text}"
+        );
+    }
 }

@@ -1,13 +1,25 @@
 pub mod claude;
 pub mod codex;
 pub mod mcp;
+pub mod opencode;
 pub mod process;
 pub mod rate_limit;
 
 pub use claude::ClaudeCollector;
 pub use codex::CodexCollector;
 pub use mcp::McpServer;
+pub use opencode::OpenCodeCollector;
 pub use rate_limit::read_rate_limits;
+
+/// Abbreviate a filesystem path by replacing the home directory prefix with `~`.
+pub(crate) fn abbrev_path(path: &std::path::Path) -> String {
+    if let Some(home) = dirs::home_dir() {
+        if let Ok(rel) = path.strip_prefix(&home) {
+            return format!("~/{}", rel.display());
+        }
+    }
+    path.to_string_lossy().into_owned()
+}
 
 /// Redact common secret patterns to avoid displaying credentials in the TUI.
 /// Replaces the prefix and all following non-whitespace chars with [REDACTED].
@@ -56,9 +68,29 @@ pub(crate) fn redact_secrets(s: &str) -> String {
     result
 }
 
+/// Strip control characters and Unicode bidi override/isolate marks before
+/// transcript text is stored for terminal rendering.
+pub(crate) fn sanitize_terminal_text(s: &str) -> String {
+    s.chars()
+        .filter(|c| {
+            !c.is_control()
+                && !matches!(
+                    *c,
+                    '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{200E}' | '\u{200F}'
+                )
+        })
+        .collect()
+}
+
 use crate::model::{AgentSession, OrphanPort, RateLimitInfo, SessionStatus};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::{
+    atomic::{AtomicU32, Ordering},
+    mpsc::{self, Receiver, Sender},
+    Arc,
+};
+use std::time::{Duration, Instant};
 
 /// Trait for agent-specific session collectors.
 /// Implement this to add support for a new AI coding agent.
@@ -101,6 +133,9 @@ pub struct SharedProcessData {
     /// sessions panel restores upstream behavior. Driven by the user
     /// toggle (Shift+M).
     pub mcp_suppress: bool,
+    /// Cached Desktop app-server PID -> open rollout files. This is populated
+    /// by a background scanner so slow macOS lsof calls cannot block the TUI.
+    pub desktop_rollout_fd_map: HashMap<u32, Vec<PathBuf>>,
 }
 
 impl SharedProcessData {
@@ -120,6 +155,7 @@ impl SharedProcessData {
             mcp_server_pids: HashSet::new(),
             mcp_owned_rollouts: HashSet::new(),
             mcp_suppress: true,
+            desktop_rollout_fd_map: HashMap::new(),
         }
     }
 }
@@ -132,9 +168,108 @@ struct TrackedPortChild {
     project_name: String,
 }
 
+struct DesktopRolloutScanResult {
+    pids: Vec<u32>,
+    rollouts: Option<HashMap<u32, Vec<PathBuf>>>,
+}
+
+struct DesktopRolloutScanner {
+    cached: HashMap<u32, Vec<PathBuf>>,
+    cached_pids: Vec<u32>,
+    in_flight_pids: Option<Vec<u32>>,
+    child_pid: Arc<AtomicU32>,
+    last_started: Option<Instant>,
+    tx: Sender<DesktopRolloutScanResult>,
+    rx: Receiver<DesktopRolloutScanResult>,
+}
+
+const DESKTOP_ROLLOUT_SCAN_TIMEOUT: Duration = Duration::from_secs(90);
+const DESKTOP_ROLLOUT_RESCAN_INTERVAL: Duration = Duration::from_secs(60);
+
+impl DesktopRolloutScanner {
+    fn new() -> Self {
+        let (tx, rx) = mpsc::channel();
+        Self {
+            cached: HashMap::new(),
+            cached_pids: Vec::new(),
+            in_flight_pids: None,
+            child_pid: Arc::new(AtomicU32::new(0)),
+            last_started: None,
+            tx,
+            rx,
+        }
+    }
+
+    fn update(&mut self, pids: &[u32]) -> HashMap<u32, Vec<PathBuf>> {
+        self.poll_completed();
+        if self.should_start(pids) {
+            self.start(pids.to_vec());
+        }
+        self.cached_for(pids)
+    }
+
+    fn poll_completed(&mut self) {
+        while let Ok(result) = self.rx.try_recv() {
+            self.apply_result(result);
+        }
+    }
+
+    fn apply_result(&mut self, result: DesktopRolloutScanResult) {
+        self.in_flight_pids = None;
+        if let Some(rollouts) = result.rollouts {
+            self.cached_pids = result.pids;
+            self.cached = rollouts;
+        }
+    }
+
+    fn should_start(&self, pids: &[u32]) -> bool {
+        if pids.is_empty() || self.in_flight_pids.is_some() {
+            return false;
+        }
+        if self.cached_pids != pids {
+            return true;
+        }
+        self.last_started
+            .is_none_or(|started| started.elapsed() >= DESKTOP_ROLLOUT_RESCAN_INTERVAL)
+    }
+
+    fn start(&mut self, pids: Vec<u32>) {
+        self.in_flight_pids = Some(pids.clone());
+        self.last_started = Some(Instant::now());
+        let tx = self.tx.clone();
+        let child_pid = self.child_pid.clone();
+        std::thread::spawn(move || {
+            let rollouts = mcp::map_pid_to_rollouts_with_timeout_and_pid_slot(
+                &pids,
+                DESKTOP_ROLLOUT_SCAN_TIMEOUT,
+                Some(child_pid),
+            );
+            let _ = tx.send(DesktopRolloutScanResult { pids, rollouts });
+        });
+    }
+
+    fn cached_for(&self, pids: &[u32]) -> HashMap<u32, Vec<PathBuf>> {
+        let mut map = HashMap::new();
+        for pid in pids {
+            if let Some(paths) = self.cached.get(pid) {
+                map.insert(*pid, paths.clone());
+            }
+        }
+        map
+    }
+}
+
+impl Drop for DesktopRolloutScanner {
+    fn drop(&mut self) {
+        let pid = self.child_pid.swap(0, Ordering::SeqCst);
+        mcp::kill_rollout_scan_child(pid);
+    }
+}
+
 /// Aggregates sessions from multiple collectors (Claude, Codex, etc.)
 pub struct MultiCollector {
     collectors: Vec<Box<dyn AgentCollector>>,
+    codex_enabled: bool,
     tick_count: u32,
     cached_ports: HashMap<u32, Vec<u16>>,
     /// PID set snapshot from last port scan — invalidate cache when PIDs change.
@@ -152,6 +287,7 @@ pub struct MultiCollector {
     /// behavior (mcp-server PIDs and their rollouts appear there too,
     /// with the existing 1-of-N HashMap-overwrite caveat).
     pub mcp_suppress: bool,
+    desktop_rollout_scanner: DesktopRolloutScanner,
 }
 
 /// How often to refresh expensive I/O (in ticks). 5 ticks × 2s = 10s.
@@ -161,17 +297,32 @@ impl MultiCollector {
     /// Build a collector, skipping agents whose identifier is in `hidden`.
     /// Identifiers are matched case-insensitively against each collector's
     /// `agent_cli` name (e.g. `"claude"`, `"codex"`).
+    #[cfg(test)]
     pub fn with_hidden(hidden: &[String]) -> Self {
+        Self::with_hidden_and_claude_config_dirs(hidden, &[])
+    }
+
+    pub fn with_hidden_and_claude_config_dirs(
+        hidden: &[String],
+        claude_config_dirs: &[PathBuf],
+    ) -> Self {
         let is_hidden = |name: &str| hidden.iter().any(|h| h.eq_ignore_ascii_case(name));
         let mut collectors: Vec<Box<dyn AgentCollector>> = Vec::new();
         if !is_hidden("claude") {
-            collectors.push(Box::new(ClaudeCollector::new()));
+            collectors.push(Box::new(ClaudeCollector::with_configured_dirs(
+                claude_config_dirs.to_vec(),
+            )));
         }
         if !is_hidden("codex") {
             collectors.push(Box::new(CodexCollector::new()));
         }
+        if !is_hidden("opencode") {
+            collectors.push(Box::new(OpenCodeCollector::new()));
+        }
+        let codex_enabled = !is_hidden("codex");
         Self {
             collectors,
+            codex_enabled,
             tick_count: SLOW_POLL_INTERVAL, // trigger on first tick
             cached_ports: HashMap::new(),
             cached_port_pids: Vec::new(),
@@ -180,6 +331,7 @@ impl MultiCollector {
             orphan_ports: Vec::new(),
             mcp_servers: Vec::new(),
             mcp_suppress: true,
+            desktop_rollout_scanner: DesktopRolloutScanner::new(),
         }
     }
 
@@ -233,6 +385,14 @@ impl MultiCollector {
         if self.mcp_suppress {
             shared.mcp_server_pids = detection.server_pids;
             shared.mcp_owned_rollouts = detection.owned_rollouts;
+        }
+
+        if self.codex_enabled {
+            let desktop_pids = CodexCollector::find_codex_desktop_pids_from_shared(
+                &shared.process_info,
+                &shared.mcp_server_pids,
+            );
+            shared.desktop_rollout_fd_map = self.desktop_rollout_scanner.update(&desktop_pids);
         }
 
         let mut all = Vec::new();
@@ -331,32 +491,62 @@ mod tests {
     #[test]
     fn with_hidden_empty_keeps_all_collectors() {
         let mc = MultiCollector::with_hidden(&[]);
-        assert_eq!(mc.collectors.len(), 2);
+        assert_eq!(mc.collectors.len(), 3);
     }
 
     #[test]
     fn with_hidden_codex_drops_codex_only() {
         let mc = MultiCollector::with_hidden(&["codex".to_string()]);
-        assert_eq!(mc.collectors.len(), 1);
+        assert_eq!(mc.collectors.len(), 2);
     }
 
     #[test]
     fn with_hidden_is_case_insensitive() {
         let mc = MultiCollector::with_hidden(&["CODEX".to_string()]);
-        assert_eq!(mc.collectors.len(), 1);
+        assert_eq!(mc.collectors.len(), 2);
         let mc = MultiCollector::with_hidden(&["Claude".to_string()]);
-        assert_eq!(mc.collectors.len(), 1);
+        assert_eq!(mc.collectors.len(), 2);
     }
 
     #[test]
     fn with_hidden_unknown_names_are_ignored() {
         let mc = MultiCollector::with_hidden(&["kiro".to_string(), "gemini".to_string()]);
-        assert_eq!(mc.collectors.len(), 2);
+        assert_eq!(mc.collectors.len(), 3);
     }
 
     #[test]
     fn with_hidden_all_agents_yields_empty() {
-        let mc = MultiCollector::with_hidden(&["claude".to_string(), "codex".to_string()]);
+        let mc = MultiCollector::with_hidden(&[
+            "claude".to_string(),
+            "codex".to_string(),
+            "opencode".to_string(),
+        ]);
         assert!(mc.collectors.is_empty());
+    }
+
+    #[test]
+    fn desktop_rollout_scanner_keeps_cache_on_failed_result() {
+        let mut scanner = DesktopRolloutScanner::new();
+        let mut cached = HashMap::new();
+        cached.insert(42, vec![PathBuf::from("/tmp/rollout-live.jsonl")]);
+
+        scanner.apply_result(DesktopRolloutScanResult {
+            pids: vec![42],
+            rollouts: Some(cached.clone()),
+        });
+        scanner.apply_result(DesktopRolloutScanResult {
+            pids: vec![42],
+            rollouts: None,
+        });
+
+        assert_eq!(scanner.cached_for(&[42]), cached);
+    }
+
+    #[test]
+    fn desktop_rollout_scanner_in_flight_guard_blocks_duplicate_scan() {
+        let mut scanner = DesktopRolloutScanner::new();
+        scanner.in_flight_pids = Some(vec![42]);
+
+        assert!(!scanner.should_start(&[42]));
     }
 }

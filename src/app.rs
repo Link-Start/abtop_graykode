@@ -3,6 +3,7 @@ use crate::host_info::{AgentAggregate, HostMetrics, HostSampler};
 use crate::model::{AgentSession, OrphanPort, RateLimitInfo, SessionStatus};
 use crate::theme::Theme;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::Instant;
 
@@ -32,6 +33,54 @@ pub enum JumpOutcome {
     Failed(String),
     /// Not in tmux, or nothing selected — nothing happened.
     NoOp,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NarrowTab {
+    Work,
+    Usage,
+    System,
+}
+
+impl NarrowTab {
+    pub const ALL: [Self; 3] = [Self::Work, Self::Usage, Self::System];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Work => "Work",
+            Self::Usage => "Usage",
+            Self::System => "System",
+        }
+    }
+
+    pub fn shortcut(self) -> char {
+        match self {
+            Self::Work => 'w',
+            Self::Usage => 'u',
+            Self::System => 's',
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NarrowSection {
+    Sessions,
+    Projects,
+    Context,
+    Quota,
+    Tokens,
+    Ports,
+    Mcp,
+}
+
+impl NarrowSection {
+    pub fn tab(self) -> NarrowTab {
+        match self {
+            Self::Sessions | Self::Projects => NarrowTab::Work,
+            Self::Context | Self::Quota | Self::Tokens => NarrowTab::Usage,
+            Self::Ports | Self::Mcp => NarrowTab::System,
+        }
+    }
 }
 
 pub struct App {
@@ -71,6 +120,9 @@ pub struct App {
     pub show_ports: bool,
     pub show_sessions: bool,
     pub show_mcp: bool,
+    pub narrow_tab: NarrowTab,
+    pub active_narrow_section: Option<NarrowSection>,
+    pub maximized_narrow_section: Option<NarrowSection>,
     /// MCP servers detected on the most recent tick (sourced from
     /// MultiCollector). Populated regardless of `show_mcp` so panel
     /// toggling doesn't cost a discovery roundtrip.
@@ -99,14 +151,25 @@ pub struct App {
 }
 
 impl App {
+    #[cfg(test)]
     pub fn new_with_config(
         theme: Theme,
         hidden_agents: &[String],
         panels: crate::config::PanelVisibility,
     ) -> Self {
+        Self::new_with_config_and_claude_dirs(theme, hidden_agents, panels, &[])
+    }
+
+    pub fn new_with_config_and_claude_dirs(
+        theme: Theme,
+        hidden_agents: &[String],
+        panels: crate::config::PanelVisibility,
+        claude_config_dirs: &[PathBuf],
+    ) -> Self {
         let (tx, rx) = mpsc::channel();
         let summaries = load_summary_cache();
-        let mut collector = MultiCollector::with_hidden(hidden_agents);
+        let mut collector =
+            MultiCollector::with_hidden_and_claude_config_dirs(hidden_agents, claude_config_dirs);
         collector.set_mcp_suppress(true);
         Self {
             sessions: Vec::new(),
@@ -133,6 +196,9 @@ impl App {
             show_ports: panels.ports,
             show_sessions: panels.sessions,
             show_mcp: panels.mcp,
+            narrow_tab: NarrowTab::Work,
+            active_narrow_section: Some(NarrowSection::Sessions),
+            maximized_narrow_section: None,
             mcp_servers: Vec::new(),
             mcp_suppress_sessions: true,
             config_open: false,
@@ -177,6 +243,7 @@ impl App {
             _ => return,
         }
         self.persist_panel_visibility();
+        self.clamp_narrow_tab();
     }
 
     /// Toggle whether mcp-server-owned rollouts are hidden from the
@@ -249,6 +316,153 @@ impl App {
             _ => return,
         }
         self.persist_panel_visibility();
+        self.clamp_narrow_tab();
+    }
+
+    pub fn narrow_tab_visible(&self, tab: NarrowTab) -> bool {
+        match tab {
+            NarrowTab::Work => self.show_sessions || self.show_projects,
+            NarrowTab::Usage => self.show_context || self.show_quota || self.show_tokens,
+            NarrowTab::System => self.show_ports || self.show_mcp,
+        }
+    }
+
+    pub fn visible_narrow_tabs(&self) -> Vec<NarrowTab> {
+        NarrowTab::ALL
+            .into_iter()
+            .filter(|&tab| self.narrow_tab_visible(tab))
+            .collect()
+    }
+
+    pub fn active_narrow_tab(&self) -> Option<NarrowTab> {
+        if self.narrow_tab_visible(self.narrow_tab) {
+            Some(self.narrow_tab)
+        } else {
+            NarrowTab::ALL
+                .into_iter()
+                .find(|&tab| self.narrow_tab_visible(tab))
+        }
+    }
+
+    pub fn set_narrow_tab(&mut self, tab: NarrowTab) {
+        if self.narrow_tab_visible(tab) {
+            self.narrow_tab = tab;
+            self.clamp_narrow_section();
+        }
+    }
+
+    pub fn select_next_narrow_tab(&mut self) {
+        let tabs = self.visible_narrow_tabs();
+        if tabs.is_empty() {
+            return;
+        }
+        let current = self.active_narrow_tab().unwrap_or(tabs[0]);
+        let pos = tabs.iter().position(|&tab| tab == current).unwrap_or(0);
+        self.narrow_tab = tabs[(pos + 1) % tabs.len()];
+        self.clamp_narrow_section();
+    }
+
+    pub fn select_prev_narrow_tab(&mut self) {
+        let tabs = self.visible_narrow_tabs();
+        if tabs.is_empty() {
+            return;
+        }
+        let current = self.active_narrow_tab().unwrap_or(tabs[0]);
+        let pos = tabs.iter().position(|&tab| tab == current).unwrap_or(0);
+        self.narrow_tab = tabs[(pos + tabs.len() - 1) % tabs.len()];
+        self.clamp_narrow_section();
+    }
+
+    fn clamp_narrow_tab(&mut self) {
+        if let Some(tab) = self.active_narrow_tab() {
+            self.narrow_tab = tab;
+        }
+        self.clamp_narrow_section();
+    }
+
+    pub fn narrow_section_visible(&self, section: NarrowSection) -> bool {
+        match section {
+            NarrowSection::Sessions => self.show_sessions,
+            NarrowSection::Projects => self.show_projects,
+            NarrowSection::Context => self.show_context,
+            NarrowSection::Quota => self.show_quota,
+            NarrowSection::Tokens => self.show_tokens,
+            NarrowSection::Ports => self.show_ports,
+            NarrowSection::Mcp => self.show_mcp,
+        }
+    }
+
+    pub fn visible_narrow_sections(&self, tab: NarrowTab) -> Vec<NarrowSection> {
+        let sections: &[NarrowSection] = match tab {
+            NarrowTab::Work => &[NarrowSection::Sessions, NarrowSection::Projects],
+            NarrowTab::Usage => &[
+                NarrowSection::Context,
+                NarrowSection::Quota,
+                NarrowSection::Tokens,
+            ],
+            NarrowTab::System => &[NarrowSection::Ports, NarrowSection::Mcp],
+        };
+        sections
+            .iter()
+            .copied()
+            .filter(|&section| self.narrow_section_visible(section))
+            .collect()
+    }
+
+    pub fn active_narrow_section(&self) -> Option<NarrowSection> {
+        let tab = self.active_narrow_tab()?;
+        if let Some(section) = self.active_narrow_section {
+            if section.tab() == tab && self.narrow_section_visible(section) {
+                return Some(section);
+            }
+        }
+        self.visible_narrow_sections(tab).into_iter().next()
+    }
+
+    pub fn set_active_narrow_section(&mut self, section: NarrowSection) {
+        if self.narrow_section_visible(section) {
+            self.narrow_tab = section.tab();
+            self.active_narrow_section = Some(section);
+            self.clamp_narrow_section();
+        }
+    }
+
+    pub fn maximized_narrow_section(&self) -> Option<NarrowSection> {
+        let section = self.maximized_narrow_section?;
+        if self.active_narrow_tab() == Some(section.tab()) && self.narrow_section_visible(section) {
+            Some(section)
+        } else {
+            None
+        }
+    }
+
+    pub fn toggle_narrow_section_zoom(&mut self, section: NarrowSection) {
+        if !self.narrow_section_visible(section) {
+            return;
+        }
+        self.set_active_narrow_section(section);
+        self.maximized_narrow_section = if self.maximized_narrow_section() == Some(section) {
+            None
+        } else {
+            Some(section)
+        };
+    }
+
+    pub fn maximize_active_narrow_section(&mut self) {
+        if let Some(section) = self.active_narrow_section() {
+            self.maximized_narrow_section = Some(section);
+        }
+    }
+
+    pub fn restore_narrow_sections(&mut self) {
+        self.maximized_narrow_section = None;
+    }
+
+    fn clamp_narrow_section(&mut self) {
+        self.active_narrow_section = self.active_narrow_section();
+        if self.maximized_narrow_section().is_none() {
+            self.maximized_narrow_section = None;
+        }
     }
 
     pub fn toggle_timeline(&mut self) {
@@ -276,7 +490,21 @@ impl App {
         self.status_msg = Some((msg, Instant::now()));
     }
 
+    /// Full refresh used by the TUI: collect monitored data, then generate and
+    /// retry session summaries. Equivalent to [`App::tick_no_summaries`] followed
+    /// by [`App::drain_and_retry_summaries`].
     pub fn tick(&mut self) {
+        self.tick_no_summaries();
+        self.drain_and_retry_summaries();
+    }
+
+    /// Refresh all monitored data WITHOUT spawning background summary jobs.
+    ///
+    /// `tick` additionally calls [`App::drain_and_retry_summaries`], which
+    /// shells out to `claude --print` to generate session titles. Headless
+    /// consumers (e.g. the web snapshot API) call this variant so they never
+    /// spawn subprocesses or consume the user's Claude quota.
+    pub fn tick_no_summaries(&mut self) {
         self.collector.set_mcp_suppress(self.mcp_suppress_sessions);
         self.sessions = self.collector.collect();
         self.orphan_ports = self.collector.orphan_ports.clone();
@@ -318,8 +546,6 @@ impl App {
         }
 
         promote_waiting_to_rate_limited(&mut self.sessions, &self.rate_limits);
-
-        self.drain_and_retry_summaries();
     }
 
     /// Drain completed summary results and spawn retries. Does NOT recollect
@@ -474,19 +700,25 @@ impl App {
         }
     }
 
+    pub fn select_session(&mut self, index: usize) {
+        if index < self.sessions.len() && self.visible_indices().contains(&index) {
+            self.selected = index;
+        }
+    }
+
     pub fn kill_selected(&mut self) {
         if self.sessions.is_empty() {
             return;
         }
         let session = &self.sessions[self.selected];
-        if session.status == SessionStatus::Done {
+        if matches!(session.status, SessionStatus::Done | SessionStatus::Unknown) {
             return;
         }
 
         // Check if we have a pending confirmation for this exact session
         if let Some((idx, ts)) = self.kill_confirm.take() {
             if idx == self.selected && ts.elapsed().as_secs() < 2 {
-                // Confirmed — verify PID still runs expected binary before killing
+                // Confirmed — verify PID still runs a killable agent before killing
                 let pid = session.pid;
                 let verified = std::process::Command::new("ps")
                     .args(["-p", &pid.to_string(), "-o", "command="])
@@ -494,12 +726,11 @@ impl App {
                     .ok()
                     .map(|output| {
                         let cmd = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                        crate::collector::process::cmd_has_binary(&cmd, "claude")
-                            || crate::collector::process::cmd_has_binary(&cmd, "codex")
+                        is_killable_agent_command(&cmd)
                     })
                     .unwrap_or(false);
                 if !verified {
-                    self.set_status(format!("PID {} is no longer a claude/codex process", pid));
+                    self.set_status(format!("PID {} is no longer a known agent process", pid));
                     return;
                 }
                 let _ = std::process::Command::new("kill")
@@ -858,6 +1089,17 @@ fn promote_waiting_to_rate_limited(sessions: &mut [AgentSession], rate_limits: &
     }
 }
 
+fn is_supported_agent_command(cmd: &str) -> bool {
+    crate::collector::process::cmd_has_binary(cmd, "claude")
+        || crate::collector::process::cmd_has_binary(cmd, "codex")
+        || crate::collector::process::cmd_has_binary(cmd, "opencode")
+}
+
+fn is_killable_agent_command(cmd: &str) -> bool {
+    is_supported_agent_command(cmd)
+        && !(crate::collector::process::cmd_has_binary(cmd, "codex") && cmd.contains(" app-server"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -893,10 +1135,12 @@ mod tests {
             children: vec![],
             initial_prompt: String::new(),
             first_assistant_text: String::new(),
+            chat_messages: vec![],
             tool_calls: vec![],
             pending_since_ms: 0,
             thinking_since_ms: 0,
             file_accesses: vec![],
+            config_root: String::new(),
             git_added: 0,
             git_modified: 0,
         }
@@ -939,5 +1183,22 @@ mod tests {
         let limits = vec![rate_limit("claude", 99.0)];
         promote_waiting_to_rate_limited(&mut sessions, &limits);
         assert_eq!(sessions[0].status, SessionStatus::Thinking);
+    }
+
+    #[test]
+    fn supported_agent_command_accepts_opencode() {
+        assert!(is_supported_agent_command("/usr/local/bin/claude"));
+        assert!(is_supported_agent_command("codex --resume abc"));
+        assert!(is_supported_agent_command("/opt/homebrew/bin/opencode"));
+        assert!(!is_supported_agent_command("node server.js"));
+    }
+
+    #[test]
+    fn killable_agent_command_rejects_codex_app_server() {
+        assert!(is_killable_agent_command("codex --resume abc"));
+        assert!(is_killable_agent_command("/usr/local/bin/claude"));
+        assert!(!is_killable_agent_command(
+            "/Applications/Codex.app/Contents/Resources/codex app-server --analytics-default-enabled"
+        ));
     }
 }

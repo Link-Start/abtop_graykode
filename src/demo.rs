@@ -1,7 +1,7 @@
 use crate::app::App;
 use crate::model::{
-    AgentSession, ChildProcess, FileAccess, FileOp, OrphanPort, RateLimitInfo, SessionStatus,
-    SubAgent, ToolCall,
+    AgentSession, ChatMessage, ChatRole, ChildProcess, FileAccess, FileOp, OrphanPort,
+    RateLimitInfo, SessionStatus, SubAgent, ToolCall,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -89,6 +89,24 @@ pub fn populate_demo(app: &mut App) {
             ],
 
             first_assistant_text: String::new(),
+            chat_messages: vec![
+                ChatMessage {
+                    role: ChatRole::User,
+                    text: "Implement Stripe payment integration for checkout flow".into(),
+                },
+                ChatMessage {
+                    role: ChatRole::Assistant,
+                    text: "I'll inspect checkout and config paths first, then wire the smallest payment boundary.".into(),
+                },
+                ChatMessage {
+                    role: ChatRole::User,
+                    text: "Keep webhook handling minimal and make tests cover declined cards.".into(),
+                },
+                ChatMessage {
+                    role: ChatRole::Assistant,
+                    text: "Payment code is in place; current pass is tightening test failures around webhook signatures.".into(),
+                },
+            ],
             initial_prompt: "Implement Stripe payment integration for checkout flow".into(),
             tool_calls: vec![
                 ToolCall {
@@ -180,6 +198,7 @@ pub fn populate_demo(app: &mut App) {
             ],
             pending_since_ms: now - 6_000, // 6s ago => bar animates
             thinking_since_ms: 0,
+            config_root: "~/.claude".into(),
             file_accesses: vec![
                 FileAccess {
                     path: "src/checkout/payment.rs".into(),
@@ -273,10 +292,21 @@ pub fn populate_demo(app: &mut App) {
             children: vec![],
 
             first_assistant_text: String::new(),
+            chat_messages: vec![
+                ChatMessage {
+                    role: ChatRole::User,
+                    text: "Add batch inference endpoint with GPU scheduling".into(),
+                },
+                ChatMessage {
+                    role: ChatRole::Assistant,
+                    text: "Endpoint is implemented; waiting on your choice for queue priority behavior.".into(),
+                },
+            ],
             initial_prompt: "Add batch inference endpoint with GPU scheduling".into(),
             tool_calls: vec![],
             pending_since_ms: 0,
             thinking_since_ms: 0,
+            config_root: "~/.claude-work".into(),
             file_accesses: vec![],
         },
         AgentSession {
@@ -332,6 +362,16 @@ pub fn populate_demo(app: &mut App) {
             ],
 
             first_assistant_text: String::new(),
+            chat_messages: vec![
+                ChatMessage {
+                    role: ChatRole::User,
+                    text: "Fix CORS headers and add rate limiting middleware".into(),
+                },
+                ChatMessage {
+                    role: ChatRole::Assistant,
+                    text: "I'll patch middleware order, then run the API smoke tests.".into(),
+                },
+            ],
             initial_prompt: "Fix CORS headers and add rate limiting middleware".into(),
             tool_calls: vec![
                 ToolCall {
@@ -370,6 +410,7 @@ pub fn populate_demo(app: &mut App) {
             // animates. 1s offset keeps the bar visibly growing against the
             // session's 2.8s max tool duration before it caps at 100%.
             thinking_since_ms: now - 1_000,
+            config_root: "~/.claude".into(),
             file_accesses: vec![],
         },
         AgentSession {
@@ -409,10 +450,63 @@ pub fn populate_demo(app: &mut App) {
             }],
 
             first_assistant_text: String::new(),
+            chat_messages: vec![
+                ChatMessage {
+                    role: ChatRole::User,
+                    text: "Create interactive heatmap component with D3.js".into(),
+                },
+                ChatMessage {
+                    role: ChatRole::Assistant,
+                    text: "Building the component now; next check is responsive canvas sizing.".into(),
+                },
+            ],
             initial_prompt: "Create interactive heatmap component with D3.js".into(),
             tool_calls: vec![],
             pending_since_ms: 0,
             thinking_since_ms: 0,
+            config_root: "~/.codex".into(),
+            file_accesses: vec![],
+        },
+        AgentSession {
+            agent_cli: "opencode",
+            pid: 9500,
+            session_id: "ses_e5f6a7b8-9abc-def0-1234-555555555555".into(),
+            cwd: "/Users/demo/infra".into(),
+            project_name: "infra".into(),
+            started_at: now - 8 * 60 * 1000, // 8m ago
+            status: SessionStatus::Thinking,
+            model: "ollama/qwen3:14b".into(),
+            effort: String::new(),
+            context_percent: 35.0,
+            total_input_tokens: 14_200,
+            total_output_tokens: 3_800,
+            total_cache_read: 0,
+            total_cache_create: 0,
+            turn_count: 9,
+            current_tasks: vec!["thinking...".into()],
+            mem_mb: 156,
+            version: "1.4.0".into(),
+            git_branch: "main".into(),
+            git_added: 1,
+            git_modified: 3,
+            token_history: vec![
+                3000, 5000, 8000, 6000, 9000, 7000, 11000, 8000, 10000,
+            ],
+            context_history: vec![],
+            compaction_count: 0,
+            context_window: 200_000,
+            subagents: vec![],
+            mem_file_count: 0,
+            mem_line_count: 0,
+            children: vec![],
+
+            first_assistant_text: String::new(),
+            chat_messages: vec![],
+            initial_prompt: "Refactor Terraform modules for multi-region".into(),
+            tool_calls: vec![],
+            pending_since_ms: 0,
+            thinking_since_ms: 0,
+            config_root: "~/.local/share/opencode".into(),
             file_accesses: vec![],
         },
     ];
@@ -433,6 +527,10 @@ pub fn populate_demo(app: &mut App) {
     app.summaries.insert(
         "d4e5f6a7-89ab-cdef-0123-444444444444".into(),
         "D3 heatmap component".into(),
+    );
+    app.summaries.insert(
+        "ses_e5f6a7b8-9abc-def0-1234-555555555555".into(),
+        "Terraform multi-region refactor".into(),
     );
 
     // --- Rate limits ---
