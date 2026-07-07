@@ -2,7 +2,7 @@
 //!
 //! Each cmux surface exports `CMUX_WORKSPACE_ID` (a UUID), inherited by the
 //! agent process. We read it from the process environment and focus the
-//! workspace via the cmux CLI, which accepts the UUID directly as `--workspace`.
+//! workspace via the cmux CLI's `workspace select` command.
 
 use super::{pid_env_var, JumpAttempt, TerminalJumper};
 use std::process::Command;
@@ -27,11 +27,14 @@ impl TerminalJumper for CmuxJumper {
         let Some(plan) = command_plan_from_env(|name| pid_env_var(pid, name)) else {
             return JumpAttempt::NotApplicable;
         };
-        match Command::new(&plan.program)
-            .args(&plan.args)
-            .envs(plan.envs.iter().map(|(key, value)| (key, value)))
-            .output()
-        {
+        let mut command = Command::new(&plan.program);
+        command.args(&plan.args);
+        for key in cmux_env_removals(std::env::vars().map(|(key, _)| key)) {
+            command.env_remove(key);
+        }
+        command.envs(plan.envs.iter().map(|(key, value)| (key, value)));
+
+        match command.output() {
             Ok(o) if o.status.success() => JumpAttempt::Jumped,
             Ok(o) if command_output_has_broken_pipe(&o.stdout, &o.stderr) => {
                 jump_via_applescript_after_socket_failure(&plan)
@@ -72,6 +75,13 @@ fn command_plan_from_env(mut env: impl FnMut(&str) -> Option<String>) -> Option<
 
 fn non_empty(value: Option<String>) -> Option<String> {
     value.filter(|v| !v.is_empty())
+}
+
+fn cmux_env_removals(env_keys: impl IntoIterator<Item = String>) -> Vec<String> {
+    env_keys
+        .into_iter()
+        .filter(|key| key.starts_with("CMUX_"))
+        .collect()
 }
 
 fn jump_via_applescript(plan: &CmuxCommandPlan) -> JumpAttempt {
@@ -234,6 +244,23 @@ mod tests {
     }
 
     #[test]
+    fn applescript_string_escapes_quotes_and_backslashes() {
+        assert_eq!(applescript_string(r#"a\b"c"#), r#""a\\b\"c""#);
+    }
+
+    #[test]
+    fn cmux_env_removals_only_removes_cmux_keys() {
+        let removals = cmux_env_removals([
+            "CMUX_WORKSPACE_ID".to_string(),
+            "PATH".to_string(),
+            "CMUX_SOCKET_PATH".to_string(),
+            "HOME".to_string(),
+        ]);
+
+        assert_eq!(removals, ["CMUX_WORKSPACE_ID", "CMUX_SOCKET_PATH"]);
+    }
+
+    #[test]
     fn broken_pipe_attempts_applescript_fallback() {
         let plan = CmuxCommandPlan {
             workspace_id: "workspace-1".to_string(),
@@ -253,5 +280,25 @@ mod tests {
 
         assert_eq!(result, JumpAttempt::Jumped);
         assert!(called);
+    }
+
+    #[test]
+    fn broken_pipe_reports_socket_failure_when_applescript_is_unavailable() {
+        let plan = CmuxCommandPlan {
+            workspace_id: "workspace-1".to_string(),
+            terminal_id: Some("terminal-1".to_string()),
+            program: "cmux".to_string(),
+            args: vec![],
+            envs: vec![],
+        };
+
+        let result = jump_via_applescript_after_socket_failure_with(&plan, |_| {
+            JumpAttempt::Failed("AppleScript not runnable (No such file or directory)".to_string())
+        });
+
+        assert_eq!(
+            result,
+            JumpAttempt::Failed("socket broken; restart cmux".to_string())
+        );
     }
 }
